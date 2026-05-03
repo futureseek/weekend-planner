@@ -1,57 +1,62 @@
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
+
+from agent import build_graph, PlannerState
 
 
-SYSTEM_PROMPT = """你是"周末去哪儿"AI行程规划助手。
-用户会告诉你他们的位置、出行人数、预算、偏好等信息。
-你需要帮他们规划周末行程，推荐具体的地点和活动。
-回复要简洁友好，带有emoji，突出亮点。"""
+DEFAULT_STATE = {
+    "turn_number": 0,
+    "intent": "plan",
+    "location": None,
+    "budget": None,
+    "preferences": [],
+    "people_count": None,
+    "time_slot": None,
+    "ask_count": 0,
+    "info_complete": False,
+    "force_generate": False,
+    "itinerary": None,
+}
 
 
 class ChatService:
     def __init__(self, config: dict):
-        self.llm = ChatOpenAI(
-            model=config["model_name"],
-            api_key=config["api_key"],
-            base_url=config["base_url"],
-            temperature=0.7,
-        )
-        self.sessions: dict[str, list] = {}
+        self.graph = build_graph(config)
 
-    def _get_history(self, session_id: str) -> list:
-        if session_id not in self.sessions:
-            self.sessions[session_id] = []
-        return self.sessions[session_id]
+    def _get_config(self, session_id: str) -> dict:
+        return {"configurable": {"thread_id": session_id}}
 
-    def chat(self, message: str, session_id: str = "default") -> str:
-        history = self._get_history(session_id)
+    def chat(self, message: str, session_id: str = "default") -> dict:
+        config = self._get_config(session_id)
 
-        messages = [SystemMessage(content=SYSTEM_PROMPT)]
-        for msg in history:
-            messages.append(msg)
-        messages.append(HumanMessage(content=message))
+        current = self.graph.get_state(config)
+        if not current.values:
+            input_state = {
+                **DEFAULT_STATE,
+                "thread_id": session_id,
+                "messages": [HumanMessage(content=message)],
+            }
+        else:
+            input_state = {
+                "messages": [HumanMessage(content=message)],
+            }
 
-        response = self.llm.invoke(messages)
-        reply = response.content
+        result = self.graph.invoke(input_state, config)
 
-        history.append(HumanMessage(content=message))
-        history.append(AIMessage(content=reply))
+        reply = ""
+        for msg in reversed(result.get("messages", [])):
+            if isinstance(msg, AIMessage):
+                reply = msg.content
+                break
 
-        return reply
+        return {
+            "reply": reply,
+            "itinerary": result.get("itinerary"),
+            "intent": result.get("intent"),
+        }
 
     def chat_stream(self, message: str, session_id: str = "default"):
-        history = self._get_history(session_id)
+        result = self.chat(message, session_id)
+        reply = result["reply"]
 
-        messages = [SystemMessage(content=SYSTEM_PROMPT)]
-        for msg in history:
-            messages.append(msg)
-        messages.append(HumanMessage(content=message))
-
-        full_reply = ""
-        for chunk in self.llm.stream(messages):
-            content = chunk.content
-            full_reply += content
-            yield content
-
-        history.append(HumanMessage(content=message))
-        history.append(AIMessage(content=full_reply))
+        for i in range(0, len(reply), 3):
+            yield reply[i:i+3]

@@ -21,16 +21,16 @@ def chat():
     if not message:
         return jsonify({"error": "message is required"}), 400
 
-    def generate():
-        for chunk in chat_service.chat_stream(message, session_id):
-            yield f"data: {json.dumps({'content': chunk})}\n\n"
-        yield f"data: {json.dumps({'done': True})}\n\n"
+    result = chat_service.chat(message, session_id)
+    return jsonify({
+        "reply": result["reply"],
+        "itinerary": result.get("itinerary"),
+        "intent": result.get("intent"),
+    })
 
-    return Response(generate(), mimetype="text/event-stream")
 
-
-@app.route("/api/chat/sync", methods=["POST"])
-def chat_sync():
+@app.route("/api/chat/stream", methods=["POST"])
+def chat_stream():
     data = request.get_json()
     message = data.get("message", "").strip()
     session_id = data.get("session_id", "default")
@@ -38,8 +38,12 @@ def chat_sync():
     if not message:
         return jsonify({"error": "message is required"}), 400
 
-    result = chat_service.chat(message, session_id)
-    return jsonify({"reply": result})
+    def generate():
+        for chunk in chat_service.chat_stream(message, session_id):
+            yield f"data: {json.dumps({'content': chunk})}\n\n"
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream")
 
 
 @app.route("/api/health", methods=["GET"])

@@ -8,6 +8,7 @@
 weekend-planner/
 ├── frontend/          # Next.js 前端
 ├── backend/           # Flask + LangGraph 后端
+├── config/            # API 配置（不提交到 Git）
 ├── docs/              # 文档
 ├── data/              # 本地数据（POI知识库等）
 └── README.md
@@ -22,18 +23,35 @@ weekend-planner/
 
 ## 快速启动
 
-### 后端
+### 1. 配置 API
+
+在项目根目录创建 `config/api_config.json`：
+
+```json
+{
+  "model": {
+    "qa_agent": {
+      "model_name": "你的模型名称",
+      "api_key": "你的API Key",
+      "base_url": "你的API地址"
+    }
+  }
+}
+```
+
+支持 OpenAI 兼容格式的任意 LLM（如 OpenAI、Claude、DeepSeek、MiMo 等）。
+
+### 2. 后端
 
 ```bash
 cd backend
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env  # 填入API Key
-python app.py
+uv sync          # 安装依赖
+uv run python app.py
 ```
 
-### 前端
+后端运行在 http://127.0.0.1:5000
+
+### 3. 前端
 
 ```bash
 cd frontend
@@ -41,4 +59,20 @@ npm install
 npm run dev
 ```
 
-访问 http://localhost:3000
+前端运行在 http://localhost:3000
+
+## API 接口
+
+### POST /api/chat
+
+```json
+// 请求
+{ "message": "周六下午在杭州，预算300", "session_id": "default" }
+
+// 响应
+{
+  "reply": "帮你规划好了！",
+  "itinerary": { "blocks": [...], "connections": [...] },
+  "intent": "plan"
+}
+```
