@@ -14,6 +14,7 @@ DEFAULT_STATE = {
     "ask_count": 0,
     "info_complete": False,
     "force_generate": False,
+    "social_recommendations": "",
     "itinerary": None,
 }
 

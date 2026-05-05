@@ -23,5 +23,8 @@ class PlannerState(TypedDict):
     info_complete: bool
     force_generate: bool
 
+    # 社媒推荐
+    social_recommendations: str
+
     # 输出
     itinerary: dict | None

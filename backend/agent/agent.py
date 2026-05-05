@@ -2,7 +2,6 @@ import json
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 
-
 MAX_TOOL_ROUNDS = 5
 
 
@@ -10,13 +9,13 @@ def _log(msg: str):
     print(f"[agent] {msg}")
 
 
-GENERATE_SYSTEM = """你是行程规划助手。你有两个工具可用：
+GENERATE_SYSTEM = """你是行程规划助手。你有以下工具可用：
 1. batch_search_poi(keywords, city) - 批量搜索地点
 2. plan_route(locations, names) - 计算路线
 
 工作流程：
 1. 调用 batch_search_poi 搜索地点（将用户偏好转为关键词，如"探店"→["咖啡店","特色小店"]）
-2. 从结果中挑选 3-5 个地点
+2. 从结果中挑选 3-5 个地点，如果有社媒推荐信息，需要综合判断（社媒推荐仅供参考，以 POI 搜索的实际数据为准）
 3. 调用 plan_route 计算路线（只调一次）
 4. 收到 plan_route 结果后，直接输出最终行程 JSON，不要再调用任何工具
 
@@ -28,6 +27,8 @@ GENERATE_PROMPT = """用户信息：
 - 偏好：{preferences}
 - 人数：{people_count} 人
 - 时间：{time_slot}
+
+{social_section}
 
 请开始搜索地点。最终输出 JSON 格式：
 {{
@@ -55,45 +56,70 @@ GENERATE_PROMPT = """用户信息：
   "total_price": 300
 }}"""
 
+SOCIAL_SYSTEM = """你是社媒推荐搜索助手。你只有一个工具可用：
+- search_reviews(query) - 搜索地点的用户评价和推荐
+
+工作流程：
+1. 根据用户的位置和偏好，生成 2-3 个精准的搜索问题
+2. 对每个问题调用 search_reviews 搜索
+3. 从搜索结果中提取有价值的推荐信息，总结为一段文字
+
+搜索问题示例：
+- "杭州 探店 推荐 2024"
+- "杭州 周末看展 好去处"
+
+总结要求：
+- 提取具体的地点名称、亮点、用户评价
+- 标注信息来源（大众点评/抖音/小红书等）
+- 直接输出总结文字，不要输出 JSON"""
+
+SOCIAL_PROMPT_TEMPLATE = """用户出行需求：
+- 位置：{location}
+- 偏好：{preferences}
+- 时间：{time_slot}
+
+请根据以上信息生成 2-3 个搜索问题，调用 search_reviews 搜索，然后总结推荐结果。"""
+
 
 class PlannerAgent:
-    def __init__(self, llm_with_tools, tools: list):
+    def __init__(self, llm_with_tools, tools: list, system_prompt: str = "", prompt_template: str = ""):
         self.llm = llm_with_tools
         self.tools = {t.name: t for t in tools}
+        self.system_prompt = system_prompt or GENERATE_SYSTEM
+        self.prompt_template = prompt_template or GENERATE_PROMPT
 
     def run(self, state: dict) -> dict:
-        """执行工具调用循环，返回最终结果。
-
-        Args:
-            state: 当前 PlannerState
-
-        Returns:
-            dict: {"messages": [AIMessage], "itinerary": dict|None}
-        """
+        """执行工具调用循环，返回最终结果。"""
         _log("进入 Agent 执行循环")
 
-        # 构建生成 prompt
-        prompt = GENERATE_PROMPT.format(
+        # 构建 prompt
+        social_section = ""
+        if state.get("social_recommendations"):
+            social_section = f"""以下是搜索引擎找到的社媒推荐（来自大众点评、抖音等平台），仅供参考，需要和 POI 搜索结果综合判断：
+---
+{state["social_recommendations"]}
+---"""
+
+        prompt = self.prompt_template.format(
             location=state.get("location") or "未知",
             budget=state.get("budget") or "不限",
             preferences=state.get("preferences") or "无特别偏好",
             people_count=state.get("people_count") or "未知",
             time_slot=state.get("time_slot") or "周末",
+            social_section=social_section,
         )
 
-        # Agent 内部维护完整对话，不经过 context trimming
         agent_messages: list[BaseMessage] = [
-            SystemMessage(content=GENERATE_SYSTEM),
+            SystemMessage(content=self.system_prompt),
             HumanMessage(content=prompt),
         ]
 
-        has_plan_route = False  # 标记是否已拿到路线结果
+        has_plan_route = False
 
         for round_num in range(1, MAX_TOOL_ROUNDS + 1):
             _log(f"第 {round_num} 轮 LLM 调用")
             response = self.llm.invoke(agent_messages)
 
-            # 没有工具调用 → 生成结束
             if not response.tool_calls:
                 _log(f"LLM 无工具调用，结束循环 (共 {round_num} 轮)")
                 itinerary = self._try_parse_itinerary(response.content)
@@ -102,7 +128,6 @@ class PlannerAgent:
                     "itinerary": itinerary,
                 }
 
-            # 有工具调用 → 执行工具
             agent_messages.append(response)
             for tc in response.tool_calls:
                 tool_name = tc["name"]
@@ -123,14 +148,12 @@ class PlannerAgent:
                 if tool_name == "plan_route":
                     has_plan_route = True
 
-            # 已拿到路线结果，注入系统提示让 LLM 直接输出 JSON
             if has_plan_route:
                 _log("已拿到路线结果，提示 LLM 输出最终行程")
                 agent_messages.append(SystemMessage(
                     content="plan_route 已返回结果，所有数据已齐备。请不要再调用任何工具，直接输出最终行程 JSON。"
                 ))
 
-        # 达到最大轮次，用最后一条有内容的响应
         _log(f"达到最大轮次 {MAX_TOOL_ROUNDS}")
         for msg in reversed(agent_messages):
             if isinstance(msg, AIMessage) and msg.content:
@@ -146,7 +169,6 @@ class PlannerAgent:
         }
 
     def _try_parse_itinerary(self, content: str) -> dict | None:
-        """尝试从 LLM 输出中解析行程 JSON"""
         text = content.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[-1]

@@ -1,9 +1,10 @@
 import json
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from .state import PlannerState
 from .context import build_context
 from .agent import PlannerAgent
+from tools.tavily import search_reviews
 
 
 def _log(node: str, msg: str):
@@ -154,6 +155,19 @@ def ask_node(state: PlannerState, llm) -> dict:
         "messages": [AIMessage(content=response.content)],
         "ask_count": state.get("ask_count", 0) + 1,
     }
+
+
+def social_agent_node(state: PlannerState, agent: PlannerAgent) -> dict:
+    _log("social", "进入社媒搜索节点")
+    result = agent.run(state)
+    # 从 Agent 的最后一条消息中提取总结文本
+    summary = ""
+    for msg in reversed(result.get("messages", [])):
+        if isinstance(msg, AIMessage) and msg.content:
+            summary = msg.content
+            break
+    _log("social", f"社媒搜索完成, 结果长度={len(summary)}")
+    return {"social_recommendations": summary}
 
 
 def generate_node(state: PlannerState, agent: PlannerAgent) -> dict:
