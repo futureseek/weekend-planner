@@ -46,6 +46,22 @@ def chat_stream():
     return Response(generate(), mimetype="text/event-stream")
 
 
+@app.route("/api/reorder", methods=["POST"])
+def reorder():
+    data = request.get_json()
+    blocks = data.get("blocks", [])
+    session_id = data.get("session_id", "default")
+
+    if not blocks:
+        return jsonify({"error": "blocks is required"}), 400
+
+    result = chat_service.reorder(blocks, session_id)
+    return jsonify({
+        "reply": result["reply"],
+        "itinerary": result.get("itinerary"),
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})

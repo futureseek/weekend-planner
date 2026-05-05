@@ -1,29 +1,12 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-
-interface ItineraryBlock {
-  id: string;
-  type: string;
-  icon: string;
-  name: string;
-  duration: number;
-  price: number;
-  recommendation: string;
-  address: string;
-}
-
-interface Itinerary {
-  blocks: ItineraryBlock[];
-  connections: { from: string; to: string; distance: string; time: string }[];
-  total_duration: number;
-  total_price: number;
-}
+import { Itinerary } from "./Canvas";
+import { apiPost } from "@/lib/api";
 
 interface Message {
   role: "user" | "assistant";
   content: string;
-  itinerary?: Itinerary | null;
 }
 
 const LOADING_TEXTS = [
@@ -35,7 +18,11 @@ const LOADING_TEXTS = [
   "总结中...",
 ];
 
-export default function Chat() {
+interface ChatProps {
+  onItinerary: (itinerary: Itinerary | null) => void;
+}
+
+export default function Chat({ onItinerary }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -66,23 +53,18 @@ export default function Chat() {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, session_id: "default" }),
-      });
-
-      if (!res.ok) throw new Error("请求失败");
-
-      const data = await res.json();
+      const data = await apiPost<{ reply: string; itinerary?: Itinerary }>(
+        "/api/chat",
+        { message: text, session_id: "default" }
+      );
       setMessages((prev) => [
         ...prev,
-        {
-          role: "assistant",
-          content: data.reply,
-          itinerary: data.itinerary,
-        },
+        { role: "assistant", content: data.reply },
       ]);
+
+      if (data.itinerary) {
+        onItinerary(data.itinerary);
+      }
     } catch {
       setMessages((prev) => [
         ...prev,
@@ -91,36 +73,6 @@ export default function Chat() {
     } finally {
       setLoading(false);
     }
-  };
-
-  const renderItinerary = (itinerary: Itinerary) => {
-    return (
-      <div className="mt-3 space-y-2">
-        {itinerary.blocks.map((block) => (
-          <div
-            key={block.id}
-            className="bg-gradient-to-r from-blue-50 to-purple-50 rounded-xl p-3 border border-blue-100"
-          >
-            <div className="flex items-center gap-2">
-              <span className="text-xl">{block.icon}</span>
-              <span className="font-medium">{block.name}</span>
-              <span className="text-xs text-gray-500 ml-auto">
-                {block.duration}min · ¥{block.price}
-              </span>
-            </div>
-            <p className="text-sm text-gray-600 mt-1">{block.recommendation}</p>
-            {block.address && (
-              <p className="text-xs text-gray-400 mt-1">📍 {block.address}</p>
-            )}
-          </div>
-        ))}
-        {itinerary.total_price > 0 && (
-          <div className="text-xs text-gray-500 text-right pt-1">
-            预计 {itinerary.total_duration}min · ¥{itinerary.total_price}
-          </div>
-        )}
-      </div>
-    );
   };
 
   return (
@@ -148,7 +100,6 @@ export default function Chat() {
               }`}
             >
               <p className="whitespace-pre-wrap">{msg.content}</p>
-              {msg.itinerary && renderItinerary(msg.itinerary)}
             </div>
           </div>
         ))}

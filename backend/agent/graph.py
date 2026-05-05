@@ -3,7 +3,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 
 from .state import PlannerState
+from .agent import PlannerAgent
 from . import nodes
+from tools import get_all_tools
 
 
 def build_graph(config: dict):
@@ -14,12 +16,16 @@ def build_graph(config: dict):
         temperature=0.7,
     )
 
+    tools = get_all_tools()
+    llm_with_tools = llm.bind_tools(tools)
+    agent = PlannerAgent(llm_with_tools, tools)
+
     graph = StateGraph(PlannerState)
 
     graph.add_node("intent_node", lambda s: nodes.intent_node(s, llm))
     graph.add_node("check_node", nodes.check_node)
     graph.add_node("ask_node", lambda s: nodes.ask_node(s, llm))
-    graph.add_node("generate_node", lambda s: nodes.generate_node(s, llm))
+    graph.add_node("generate_node", lambda s: nodes.generate_node(s, agent))
     graph.add_node("modify_node", lambda s: nodes.modify_node(s, llm))
     graph.add_node("chat_node", lambda s: nodes.chat_node(s, llm))
 
