@@ -110,13 +110,16 @@ export default function Canvas({ itinerary, onClose }: CanvasProps) {
   }, [connections]);
 
   useEffect(() => {
-    const timer = setTimeout(updateLines, 100);
+    // 等卡片渲染完成后再计算连线位置
+    const timer1 = setTimeout(updateLines, 100);
+    const timer2 = setTimeout(updateLines, 300); // 兜底重试
     window.addEventListener("resize", updateLines);
     return () => {
-      clearTimeout(timer);
+      clearTimeout(timer1);
+      clearTimeout(timer2);
       window.removeEventListener("resize", updateLines);
     };
-  }, [blocks, updateLines]);
+  }, [blocks, connections, updateLines]);
 
   if (!itinerary) return null;
 

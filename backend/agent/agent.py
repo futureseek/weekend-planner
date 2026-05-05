@@ -17,9 +17,22 @@ GENERATE_SYSTEM = """你是行程规划助手。你有以下工具可用：
 1. 调用 batch_search_poi 搜索地点（将用户偏好转为关键词，如"探店"→["咖啡店","特色小店"]）
 2. 从结果中挑选 3-5 个地点，如果有社媒推荐信息，需要综合判断（社媒推荐仅供参考，以 POI 搜索的实际数据为准）
 3. 调用 plan_route 计算路线（只调一次）
-4. 收到 plan_route 结果后，直接输出最终行程 JSON，不要再调用任何工具
+4. 收到 plan_route 结果后，输出行程介绍和 JSON，不要再调用任何工具
 
-重要：当你已经拿到 plan_route 的返回结果时，说明所有数据已齐备，必须立即输出最终 JSON 行程。"""
+输出格式要求：
+先写一段自然的行程介绍（用emoji、简短有亮点），然后用 ```json 代码块输出行程 JSON。
+示例格式：
+为你规划了一份周六下午的行程！
+
+🎨 浙江美术馆 → ☕ 福叁咖啡 → 🍜 芳明小吃
+
+总预算 93 元，3 个地点骑行串联，节奏舒适不赶。
+
+```json
+{"blocks": [...], "connections": [...], "total_duration": 240, "total_price": 93}
+```
+
+重要：当你已经拿到 plan_route 的返回结果时，说明所有数据已齐备，必须立即输出行程。"""
 
 GENERATE_PROMPT = """用户信息：
 - 位置：{location}
@@ -123,8 +136,9 @@ class PlannerAgent:
             if not response.tool_calls:
                 _log(f"LLM 无工具调用，结束循环 (共 {round_num} 轮)")
                 itinerary = self._try_parse_itinerary(response.content)
+                reply = self._extract_reply(response.content, itinerary)
                 return {
-                    "messages": [AIMessage(content=response.content if not itinerary else "帮你规划好了！以下是行程方案：")],
+                    "messages": [AIMessage(content=reply)],
                     "itinerary": itinerary,
                 }
 
@@ -158,8 +172,9 @@ class PlannerAgent:
         for msg in reversed(agent_messages):
             if isinstance(msg, AIMessage) and msg.content:
                 itinerary = self._try_parse_itinerary(msg.content)
+                reply = self._extract_reply(msg.content, itinerary)
                 return {
-                    "messages": [AIMessage(content=msg.content if not itinerary else "帮你规划好了！以下是行程方案：")],
+                    "messages": [AIMessage(content=reply)],
                     "itinerary": itinerary,
                 }
 
@@ -168,7 +183,31 @@ class PlannerAgent:
             "itinerary": None,
         }
 
+    def _extract_reply(self, content: str, itinerary: dict | None) -> str:
+        """从 LLM 输出中提取回复文字（去掉 JSON 代码块）"""
+        if not itinerary:
+            return content
+
+        import re
+        reply = re.sub(r'```json\s*\n.*?\n```', '', content, flags=re.DOTALL).strip()
+        if reply:
+            return reply
+        return "帮你规划好了！以下是行程方案 👇"
+
     def _try_parse_itinerary(self, content: str) -> dict | None:
+        import re
+
+        # 先尝试从 ```json ... ``` 代码块中提取
+        match = re.search(r'```json\s*\n(.*?)\n```', content, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                if isinstance(data, dict) and "blocks" in data:
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        # 尝试直接解析（纯 JSON 响应）
         text = content.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[-1]
@@ -179,4 +218,5 @@ class PlannerAgent:
                 return data
         except json.JSONDecodeError:
             pass
+
         return None
