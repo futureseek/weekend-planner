@@ -29,17 +29,23 @@ weekend-planner/
 
 ```json
 {
+  "amap_key": "高德地图 API Key",
+  "tavily_key": "Tavily 搜索 API Key",
   "model": {
     "qa_agent": {
-      "model_name": "你的模型名称",
-      "api_key": "你的API Key",
-      "base_url": "你的API地址"
+      "model_name": "模型名称",
+      "api_key": "API Key",
+      "base_url": "API 地址"
     }
   }
 }
 ```
 
-支持 OpenAI 兼容格式的任意 LLM（如 OpenAI、Claude、DeepSeek、MiMo 等）。
+| 字段 | 说明 | 获取方式 |
+|------|------|----------|
+| `amap_key` | 高德地图 Web 服务 Key，用于 POI 搜索和路线规划 | [高德开放平台](https://lbs.amap.com/) |
+| `tavily_key` | Tavily 搜索引擎 Key，用于社媒推荐搜索 | [Tavily](https://tavily.com/) |
+| `model.qa_agent` | LLM 配置，支持 OpenAI 兼容格式（Claude / DeepSeek / MiMo 等） | 对应平台 |
 
 ### 2. 后端
 

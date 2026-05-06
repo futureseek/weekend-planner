@@ -1,8 +1,14 @@
 import json
+import os
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
 
-TAVILY_API_KEY = "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"
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "api_config.json")
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    _config = json.load(f)
+
+TAVILY_API_KEY = _config.get("tavily_key", "")
 
 
 @tool
