@@ -206,3 +206,221 @@ def chat_node(state: PlannerState, llm) -> dict:
     return {
         "messages": [AIMessage(content=response.content)],
     }
+
+
+# ============ 新增节点：数据驱动流程 ============
+
+def collect_data_node(state: PlannerState, llm) -> dict:
+    """数据收集节点：解析约束、查询 POI、补全评价"""
+    _log("collect_data", "进入数据收集节点")
+
+    from services.intent_parser import parse_constraints, resolve_area, DEFAULT_CONSTRAINTS
+    from services.poi_service import search_or_fetch_pois
+    from services.review_service import enrich_reviews
+
+    # 构建当前约束
+    current_constraints = {
+        "city": state.get("location", "").replace("市", "").replace("区", ""),
+        "area": state.get("location", ""),
+        "time_slot": state.get("time_slot"),
+        "budget": state.get("budget"),
+        "people_count": state.get("people_count"),
+        "preferences": state.get("preferences", []),
+        "avoid_tags": [],
+        "transport_mode": "walking",
+        "queue_tolerance": 1 if "不想排队" in str(state.get("messages", "")) else 2,
+        "pace": "relaxed",
+        "must_visit": [],
+    }
+
+    # 解析约束
+    last_message = ""
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            last_message = msg.content
+            break
+
+    constraints = parse_constraints(last_message, current_constraints, llm)
+    _log("collect_data", f"约束: {json.dumps(constraints, ensure_ascii=False)}")
+
+    # 区域解析
+    area_info = resolve_area(constraints)
+    _log("collect_data", f"区域: {area_info}")
+
+    # 搜索 POI
+    city = constraints.get("city", "杭州")
+    preferences = constraints.get("preferences", [])
+    budget = constraints.get("budget")
+    max_cost = budget * 0.4 if budget else None
+
+    pois = search_or_fetch_pois(city, preferences, max_cost, limit=10)
+    _log("collect_data", f"找到 {len(pois)} 个 POI")
+
+    # 补全评价
+    pois = enrich_reviews(pois)
+    _log("collect_data", "评价补全完成")
+
+    return {
+        "constraints": constraints,
+        "candidate_pois": pois,
+        "area_info": area_info,
+    }
+
+
+def rank_poi_node(state: PlannerState) -> dict:
+    """POI 打分节点"""
+    _log("rank_poi", "进入打分节点")
+
+    from services.route_optimizer import score_poi
+
+    pois = state.get("candidate_pois", [])
+    constraints = state.get("constraints", {})
+
+    for poi in pois:
+        poi["_score"] = score_poi(poi, constraints)
+
+    # 按分数排序
+    pois.sort(key=lambda x: x.get("_score", 0), reverse=True)
+
+    _log("rank_poi", f"打分完成，Top3: {[p['name'] for p in pois[:3]]}")
+
+    return {"candidate_pois": pois}
+
+
+def optimize_route_node(state: PlannerState) -> dict:
+    """路线优化节点"""
+    _log("optimize", "进入路线优化节点")
+
+    from services.route_optimizer import optimize_route
+
+    pois = state.get("candidate_pois", [])
+    constraints = state.get("constraints", {})
+
+    plans = optimize_route(pois, constraints, max_stops=5)
+    _log("optimize", f"生成 {len(plans)} 个方案")
+
+    if not plans:
+        return {"itinerary": None, "alternative_plans": []}
+
+    # 主方案
+    primary = plans[0]
+    itinerary = {
+        "blocks": _build_blocks(primary["route"]),
+        "connections": _build_connections(primary["route"]),
+        "total_duration": primary["score"].get("total_duration_s", 0) // 60,
+        "total_price": primary["score"].get("total_cost", 0),
+        "score": primary["score"].get("route_score", 0),
+        "plan_name": primary["name"],
+    }
+
+    # 备选方案
+    alternatives = []
+    for plan in plans[1:]:
+        alt = {
+            "name": plan["name"],
+            "blocks": _build_blocks(plan["route"]),
+            "connections": _build_connections(plan["route"]),
+            "total_duration": plan["score"].get("total_duration_s", 0) // 60,
+            "total_price": plan["score"].get("total_cost", 0),
+        }
+        alternatives.append(alt)
+
+    return {
+        "itinerary": itinerary,
+        "alternative_plans": alternatives,
+    }
+
+
+def explain_node(state: PlannerState, llm) -> dict:
+    """解释节点：LLM 生成自然语言说明"""
+    _log("explain", "进入解释节点")
+
+    itinerary = state.get("itinerary")
+    if not itinerary:
+        return {"messages": [AIMessage(content="抱歉，无法生成有效路线。")]}
+
+    # 构建解释提示
+    blocks = itinerary.get("blocks", [])
+    route_desc = []
+    for i, block in enumerate(blocks, 1):
+        cost = block.get("price", 0)
+        cost_str = f"¥{cost}" if cost > 0 else "免费"
+        route_desc.append(f"{i}. {block['name']} ({block.get('category', '')}, 人均{cost_str})")
+
+    route_text = "\n".join(route_desc)
+    constraints = state.get("constraints", {})
+
+    prompt = f"""你是行程规划助手，为用户解释路线方案。
+
+用户偏好：{constraints.get('preferences', [])}
+预算：{constraints.get('budget', '未知')}
+时间：{constraints.get('time_slot', '未知')}
+
+规划路线：
+{route_text}
+
+总时间：{itinerary.get('total_duration', 0)}分钟
+总花费：¥{itinerary.get('total_price', 0)}
+
+请用简洁友好的方式介绍这条路线，说明：
+1. 路线特点（2-3句话）
+2. 为什么这样安排
+3. 用户关心的约束是否满足
+
+保持口语化，不要编造信息。"""
+
+    response = llm.invoke([HumanMessage(content=prompt)])
+    _log("explain", "解释生成完成")
+
+    return {
+        "messages": [AIMessage(content=response.content)],
+    }
+
+
+def _build_blocks(route: list[dict]) -> list[dict]:
+    """构建行程卡片数据"""
+    import json as _json
+    blocks = []
+    for poi in route:
+        block = {
+            "id": poi["id"],
+            "name": poi["name"],
+            "category": poi.get("category", ""),
+            "icon": _get_category_icon(poi.get("category", "")),
+            "duration": 60,
+            "price": poi.get("avg_cost", 0),
+            "rating": poi.get("rating", 0),
+            "address": poi.get("address", ""),
+            "tags": _json.loads(poi.get("tags", "[]")) if isinstance(poi.get("tags"), str) else poi.get("tags", []),
+        }
+        blocks.append(block)
+    return blocks
+
+
+def _build_connections(route: list[dict]) -> list[dict]:
+    """构建路线连接"""
+    connections = []
+    for i in range(len(route) - 1):
+        conn = {
+            "from": route[i]["id"],
+            "to": route[i + 1]["id"],
+            "distance": "约500米",
+            "time": "约10分钟",
+            "mode": "步行",
+        }
+        connections.append(conn)
+    return connections
+
+
+def _get_category_icon(category: str) -> str:
+    """获取类别图标"""
+    icons = {
+        "咖啡": "coffee",
+        "餐厅": "food",
+        "景点": "scenic",
+        "展览": "art",
+        "公园": "park",
+        "购物": "shop",
+        "甜品": "dessert",
+    }
+    return icons.get(category, "location")

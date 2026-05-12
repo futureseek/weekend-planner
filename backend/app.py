@@ -4,9 +4,15 @@ from flask_cors import CORS
 
 from config import load_config
 from chat_service import ChatService
+from db.database import init_db
+from db.seed import seed_pois
 
 app = Flask(__name__)
 CORS(app)
+
+# 初始化数据库
+init_db()
+seed_pois()
 
 config = load_config()
 chat_service = ChatService(config)

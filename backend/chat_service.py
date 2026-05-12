@@ -16,6 +16,11 @@ DEFAULT_STATE = {
     "force_generate": False,
     "social_recommendations": "",
     "itinerary": None,
+    # 新增字段
+    "constraints": None,
+    "candidate_pois": [],
+    "area_info": None,
+    "alternative_plans": [],
 }
 
 

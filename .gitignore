@@ -35,7 +35,7 @@ Thumbs.db
 
 # Logs
 *.log
-
+docs
 # apikey
 config
 

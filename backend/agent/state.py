@@ -28,3 +28,9 @@ class PlannerState(TypedDict):
 
     # 输出
     itinerary: dict | None
+
+    # 新增：数据驱动流程
+    constraints: dict | None
+    candidate_pois: list[dict]
+    area_info: dict | None
+    alternative_plans: list[dict]
