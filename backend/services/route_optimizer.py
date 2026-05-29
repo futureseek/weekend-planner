@@ -18,7 +18,7 @@ def haversine_distance(lng1: float, lat1: float, lng2: float, lat2: float) -> fl
     return R * c
 
 
-def score_poi(poi: dict, constraints: dict, user_profile: dict = None) -> float:
+def score_poi(poi: dict, constraints: dict, user_profile: dict = None, area_center: tuple = None) -> float:
     """
     POI 打分公式
     poi_score = 0.25 * preference_match
@@ -65,9 +65,18 @@ def score_poi(poi: dict, constraints: dict, user_profile: dict = None) -> float:
         cost_fit = 0.5
     score += 0.15 * cost_fit
 
-    # 4. 距离适配 (0-1) - 暂时给默认值，后续结合路线矩阵计算
-    distance_fit = 0.5
-    score += 0.15 * distance_fit
+    # 4. 距离适配 (0-1) - 根据与区域中心的距离计算
+    if area_center:
+        dist = haversine_distance(poi["lng"], poi["lat"], area_center[0], area_center[1])
+        # 指数衰减：近距离 POI 得分显著更高，distance_weight_boost 越大衰减越快
+        boost = constraints.get("distance_weight_boost", 1.0)
+        decay = 2000 * boost  # boost=1 时 2km 衰减到 0.37，boost=3 时 667m 就衰减到 0.37
+        distance_fit = math.exp(-dist / decay)
+    else:
+        distance_fit = 0.5
+    # distance_weight_boost: 少走路时动态提高距离权重
+    dist_weight = 0.15 * constraints.get("distance_weight_boost", 1.0)
+    score += dist_weight * distance_fit
 
     # 5. UGC 热度 (0-1)
     review = poi.get("review", {})
@@ -183,10 +192,12 @@ def calculate_route_score(route: list[dict], matrix: dict, constraints: dict) ->
     play_time = len(route) * 60 * 60
     total_duration += play_time
 
-    # 路线总分
+    # 路线总分（距离惩罚受 distance_weight_boost 影响）
+    dist_boost = constraints.get("distance_weight_boost", 1.0)
+    # 距离惩罚用平方项，让长距离路线受到更重惩罚
     route_score = (
         total_poi_score
-        - 0.001 * total_distance
+        - 0.0000005 * (total_distance ** 2) * dist_boost
         - 0.01 * (total_duration / 60)
     )
 
@@ -204,31 +215,38 @@ def calculate_route_score(route: list[dict], matrix: dict, constraints: dict) ->
     }
 
 
-def optimize_route(pois: list[dict], constraints: dict, max_stops: int = 5) -> list[dict]:
+def optimize_route(pois: list[dict], constraints: dict, max_stops: int = 5,
+                   area_center: tuple = None) -> dict:
     """
     路线枚举优化
     输出 Top 3 方案：综合最优、少走路、省钱
+    返回: {"plans": [...], "matrix": {...}}
     """
     if len(pois) <= 1:
-        return [{"name": "综合最优", "route": pois, "score": {}}]
+        return {"plans": [{"name": "综合最优", "route": pois, "score": {}}], "matrix": {}}
 
-    # 限制候选数量
-    candidates = pois[:8]
+    # 解析 area_center：可能是字符串 "lng,lat" 或元组 (lng, lat)
+    center = None
+    if area_center:
+        if isinstance(area_center, str) and "," in area_center:
+            parts = area_center.split(",")
+            center = (float(parts[0]), float(parts[1]))
+        elif isinstance(area_center, (list, tuple)) and len(area_center) == 2:
+            center = (float(area_center[0]), float(area_center[1]))
 
-    # 为每个 POI 打分
-    for poi in candidates:
-        poi["_score"] = score_poi(poi, constraints)
+    # 为每个 POI 打分（传入 area_center 计算 distance_fit）
+    for poi in pois:
+        poi["_score"] = score_poi(poi, constraints, area_center=center)
 
-    # 按分数排序，取 Top N
-    candidates.sort(key=lambda x: x["_score"], reverse=True)
-    candidates = candidates[:max_stops]
+    # 类型分桶：按 category 分桶，每桶取 Top 3，确保路线多样性
+    candidates = _bucket_and_select(pois, max_stops)
 
     # 构建路线矩阵
     matrix = build_route_matrix(candidates, constraints.get("transport_mode", "walking"))
 
     # 枚举所有排列（限制数量避免组合爆炸）
     all_routes = []
-    perm_limit = min(len(candidates), 5)
+    perm_limit = min(len(candidates), max_stops)
 
     for perm in permutations(candidates, perm_limit):
         route = list(perm)
@@ -239,10 +257,25 @@ def optimize_route(pois: list[dict], constraints: dict, max_stops: int = 5) -> l
         })
 
     if not all_routes:
-        return []
+        return {"plans": [], "matrix": matrix}
+
+    # 时间约束过滤：丢弃超时方案
+    duration_limit = constraints.get("duration_minutes")
+    if duration_limit:
+        time_limit_s = duration_limit * 60
+        filtered = [r for r in all_routes if r["score_info"]["total_duration_s"] <= time_limit_s]
+        if filtered:
+            all_routes = filtered
 
     # 排序生成不同方案
     results = []
+
+    def _route_key(route):
+        return tuple(p["id"] for p in route)
+
+    def _is_duplicate(route):
+        key = _route_key(route)
+        return any(_route_key(r["route"]) == key for r in results)
 
     # 1. 综合最优
     all_routes.sort(key=lambda x: x["score_info"]["route_score"], reverse=True)
@@ -255,36 +288,64 @@ def optimize_route(pois: list[dict], constraints: dict, max_stops: int = 5) -> l
 
     # 2. 少走路
     all_routes.sort(key=lambda x: x["score_info"]["total_distance_m"])
-    less_walk = all_routes[0]
-    if less_walk["route"][0]["id"] != best["route"][0]["id"]:
-        results.append({
-            "name": "少走路",
-            "route": _clean_route(less_walk["route"]),
-            "score": less_walk["score_info"],
-        })
+    for r in all_routes:
+        if not _is_duplicate(r["route"]):
+            results.append({
+                "name": "少走路",
+                "route": _clean_route(r["route"]),
+                "score": r["score_info"],
+            })
+            break
 
     # 3. 省钱
     all_routes.sort(key=lambda x: x["score_info"]["total_cost"])
-    cheap = all_routes[0]
-    if cheap["route"][0]["id"] not in [r["route"][0]["id"] for r in results]:
-        results.append({
-            "name": "省钱",
-            "route": _clean_route(cheap["route"]),
-            "score": cheap["score_info"],
-        })
+    for r in all_routes:
+        if not _is_duplicate(r["route"]):
+            results.append({
+                "name": "省钱",
+                "route": _clean_route(r["route"]),
+                "score": r["score_info"],
+            })
+            break
 
     # 如果不足 3 个方案，从剩余中补充
     while len(results) < 3 and len(results) < len(all_routes):
+        all_routes.sort(key=lambda x: x["score_info"]["route_score"], reverse=True)
         for r in all_routes:
-            if r["route"][0]["id"] not in [res["route"][0]["id"] for res in results]:
+            if not _is_duplicate(r["route"]):
                 results.append({
                     "name": f"方案{len(results) + 1}",
                     "route": _clean_route(r["route"]),
                     "score": r["score_info"],
                 })
                 break
+        else:
+            break
 
-    return results
+    return {"plans": results, "matrix": matrix}
+
+
+def _bucket_and_select(pois: list[dict], max_stops: int) -> list[dict]:
+    """按类型分桶，每桶取 Top N，确保路线包含多种类型"""
+    buckets = {}
+    for poi in pois:
+        cat = poi.get("category", "其他")
+        buckets.setdefault(cat, []).append(poi)
+
+    # 每桶按 _score 排序取 Top 3
+    per_bucket = max(2, max_stops // max(len(buckets), 1))
+    selected = []
+    for cat, bucket_pois in buckets.items():
+        bucket_pois.sort(key=lambda x: x.get("_score", 0), reverse=True)
+        selected.extend(bucket_pois[:per_bucket])
+
+    # 如果候选不足 max_stops，直接返回
+    if len(selected) <= max_stops:
+        return selected
+
+    # 否则全局按 _score 排序取 Top max_stops
+    selected.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    return selected[:max_stops + 2]  # 多取 2 个给排列更多选择
 
 
 def _clean_route(route: list[dict]) -> list[dict]:

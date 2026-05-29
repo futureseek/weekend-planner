@@ -68,6 +68,24 @@ def reorder():
     })
 
 
+@app.route("/api/itinerary/adjust", methods=["POST"])
+def adjust_itinerary():
+    data = request.get_json()
+    action = data.get("action", "").strip()
+    session_id = data.get("session_id", "default")
+    payload = data.get("payload", {})
+
+    if not action:
+        return jsonify({"error": "action is required"}), 400
+
+    result = chat_service.adjust(action, session_id, payload)
+    return jsonify({
+        "message": result.get("message", ""),
+        "reply": result["reply"],
+        "itinerary": result.get("itinerary"),
+    })
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})

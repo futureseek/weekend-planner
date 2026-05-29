@@ -3,8 +3,6 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from .state import PlannerState
 from .context import build_context
-from .agent import PlannerAgent
-from tools.tavily import search_reviews
 
 
 def _log(node: str, msg: str):
@@ -30,15 +28,24 @@ INTENT_PROMPT = """你是行程规划助手的意图识别模块。从用户消�
   "preferences": ["偏好列表"],没提到则保持原值,
   "people_count": 人数（int），没提到则保持原值,
   "time_slot": "时间段"，没提到则保持原值,
-  "force_generate": true 或 false
+  "force_generate": true 或 false,
+  "modify_action": null 或 "less_walking" 或 "less_queue" 或 "lower_budget" 或 "replace_poi",
+  "modify_payload": null 或 {{"category": "餐厅"}}
 }}
 
 规则：
 - intent=plan：用户在描述出行需求
-- intent=modify：用户想修改已有行程（如"换个餐厅"、"去掉这个地方"）
+- intent=modify：用户想修改已有行程（如"换个餐厅"、"去掉这个地方"、"少走点路"）
 - intent=chat：闲聊（天气、笑话等与行程无关的）
 - 用户说"就这样"/"随便"/"不用问了"/"直接生成"时 force_generate=true
-- 只更新用户这次明确提到的字段，没提到的保持原值（用null表示未提到）"""
+- 只更新用户这次明确提到的字段，没提到的保持原值（用null表示未提到）
+- modify_action 提取用户想做的修改类型：
+  - "换个餐厅"/"换吃的" → replace_poi + payload.category="餐厅"
+  - "换个咖啡" → replace_poi + payload.category="咖啡"
+  - "少走点路" → less_walking
+  - "不想排队" → less_queue
+  - "省钱一点" → lower_budget
+  - 无法识别具体修改 → modify_action=null"""
 
 ASK_PROMPT = """你是行程规划助手，现在需要向用户确认一些信息。
 
@@ -53,16 +60,6 @@ ASK_PROMPT = """你是行程规划助手，现在需要向用户确认一些信�
 
 请用自然友好的方式，一次性询问缺失信息（最多问2个问题）。
 要求：口语化、简短、有emoji。不要重复已知信息。"""
-
-MODIFY_PROMPT = """用户想修改现有行程。
-
-当前行程：
-{current_itinerary}
-
-用户修改要求：{message}
-
-请只修改用户提到的部分，保持其他内容不变。
-返回与之前相同格式的 JSON 行程。"""
 
 CHAT_PROMPT = """你是"周末去哪儿"AI行程规划助手。
 用户在和你闲聊，请简短友好地回复，并自然地引导用户描述出行需求。
@@ -103,6 +100,16 @@ def intent_node(state: PlannerState, llm) -> dict:
         "intent": data.get("intent", "plan"),
         "force_generate": data.get("force_generate", False),
     }
+
+    # 提取修改动作
+    if result["intent"] == "modify":
+        modify_action = data.get("modify_action")
+        modify_payload = data.get("modify_payload")
+        if modify_action:
+            result["modify_action"] = modify_action
+            result["modify_payload"] = modify_payload
+            # modify 走数据管线，需要 force_generate
+            result["force_generate"] = True
 
     for field in ["location", "budget", "preferences", "people_count", "time_slot"]:
         val = data.get(field)
@@ -157,48 +164,6 @@ def ask_node(state: PlannerState, llm) -> dict:
     }
 
 
-def social_agent_node(state: PlannerState, agent: PlannerAgent) -> dict:
-    _log("social", "进入社媒搜索节点")
-    result = agent.run(state)
-    # 从 Agent 的最后一条消息中提取总结文本
-    summary = ""
-    for msg in reversed(result.get("messages", [])):
-        if isinstance(msg, AIMessage) and msg.content:
-            summary = msg.content
-            break
-    _log("social", f"社媒搜索完成, 结果长度={len(summary)}")
-    return {"social_recommendations": summary}
-
-
-def generate_node(state: PlannerState, agent: PlannerAgent) -> dict:
-    _log("generate", "进入生成节点，交由 Agent 执行")
-    result = agent.run(state)
-    _log("generate", f"Agent 完成, itinerary={'有' if result.get('itinerary') else '无'}")
-    return result
-
-
-def modify_node(state: PlannerState, llm) -> dict:
-    context = build_context(state)
-    prompt = MODIFY_PROMPT.format(
-        current_itinerary=json.dumps(state.get("itinerary"), ensure_ascii=False, indent=2),
-        message=state["messages"][-1].content,
-    )
-
-    response = llm.invoke(context + [HumanMessage(content=prompt)])
-    itinerary = _parse_json(response.content)
-
-    if itinerary:
-        reply = "已更新行程方案！"
-        return {
-            "messages": [AIMessage(content=reply)],
-            "itinerary": itinerary,
-        }
-
-    return {
-        "messages": [AIMessage(content=response.content)],
-    }
-
-
 def chat_node(state: PlannerState, llm) -> dict:
     context = build_context(state)
     response = llm.invoke(context + [HumanMessage(content=CHAT_PROMPT)])
@@ -211,29 +176,33 @@ def chat_node(state: PlannerState, llm) -> dict:
 # ============ 新增节点：数据驱动流程 ============
 
 def collect_data_node(state: PlannerState, llm) -> dict:
-    """数据收集节点：解析约束、查询 POI、补全评价"""
+    """数据收集节点：解析约束、查询 POI、补全评价，支持修改逻辑"""
     _log("collect_data", "进入数据收集节点")
 
     from services.intent_parser import parse_constraints, resolve_area, DEFAULT_CONSTRAINTS
     from services.poi_service import search_or_fetch_pois
     from services.review_service import enrich_reviews
 
-    # 构建当前约束
-    current_constraints = {
-        "city": state.get("location", "").replace("市", "").replace("区", ""),
-        "area": state.get("location", ""),
-        "time_slot": state.get("time_slot"),
-        "budget": state.get("budget"),
-        "people_count": state.get("people_count"),
-        "preferences": state.get("preferences", []),
-        "avoid_tags": [],
-        "transport_mode": "walking",
-        "queue_tolerance": 1 if "不想排队" in str(state.get("messages", "")) else 2,
-        "pace": "relaxed",
-        "must_visit": [],
-    }
+    # 解析约束：如果有已有约束（修改场景），以此为基础；否则从头解析
+    existing_constraints = state.get("constraints")
+    if existing_constraints:
+        current_constraints = existing_constraints
+    else:
+        current_constraints = {
+            "city": state.get("location", "").replace("市", "").replace("区", ""),
+            "area": state.get("location", ""),
+            "time_slot": state.get("time_slot"),
+            "budget": state.get("budget"),
+            "people_count": state.get("people_count"),
+            "preferences": state.get("preferences", []),
+            "avoid_tags": [],
+            "transport_mode": "walking",
+            "queue_tolerance": 1 if "不想排队" in str(state.get("messages", "")) else 2,
+            "pace": "relaxed",
+            "must_visit": [],
+        }
 
-    # 解析约束
+    # 解析约束（修改场景下仍解析以获取用户新提到的信息）
     last_message = ""
     for msg in reversed(state.get("messages", [])):
         if isinstance(msg, HumanMessage):
@@ -241,6 +210,21 @@ def collect_data_node(state: PlannerState, llm) -> dict:
             break
 
     constraints = parse_constraints(last_message, current_constraints, llm)
+
+    # 处理修改逻辑：如果有 modify_action，合并到约束中
+    modify_action = state.get("modify_action")
+    modify_payload = state.get("modify_payload") or {}
+    if modify_action:
+        if modify_action == "replace_poi":
+            constraints["must_replace_type"] = modify_payload.get("category", "餐厅")
+        elif modify_action == "less_walking":
+            constraints["distance_weight_boost"] = 3.0
+        elif modify_action == "less_queue":
+            constraints["queue_tolerance"] = 1
+        elif modify_action == "lower_budget":
+            constraints["budget"] = int(constraints.get("budget", 300) * 0.7)
+        _log("collect_data", f"修改动作: {modify_action}")
+
     _log("collect_data", f"约束: {json.dumps(constraints, ensure_ascii=False)}")
 
     # 区域解析
@@ -254,6 +238,15 @@ def collect_data_node(state: PlannerState, llm) -> dict:
     max_cost = budget * 0.4 if budget else None
 
     pois = search_or_fetch_pois(city, preferences, max_cost, limit=10)
+
+    # 如果是替换 POI 操作，排除当前行程中同类型的 POI
+    if modify_action == "replace_poi" and state.get("itinerary"):
+        replace_type = constraints.get("must_replace_type", "餐厅")
+        current_ids = {b["id"] for b in state["itinerary"].get("blocks", [])
+                       if b.get("category") == replace_type}
+        pois = [p for p in pois if p["id"] not in current_ids]
+        _log("collect_data", f"排除 {len(current_ids)} 个同类 POI")
+
     _log("collect_data", f"找到 {len(pois)} 个 POI")
 
     # 补全评价
@@ -264,6 +257,8 @@ def collect_data_node(state: PlannerState, llm) -> dict:
         "constraints": constraints,
         "candidate_pois": pois,
         "area_info": area_info,
+        "modify_action": None,
+        "modify_payload": None,
     }
 
 
@@ -295,8 +290,17 @@ def optimize_route_node(state: PlannerState) -> dict:
 
     pois = state.get("candidate_pois", [])
     constraints = state.get("constraints", {})
+    area_info = state.get("area_info") or {}
+    area_center = area_info.get("center")
+    transport_mode = constraints.get("transport_mode", "walking")
 
-    plans = optimize_route(pois, constraints, max_stops=5)
+    # 少走路时减少站点数，直接缩短总距离
+    dist_boost = constraints.get("distance_weight_boost", 1.0)
+    max_stops = 4 if dist_boost > 1.5 else 5
+
+    opt_result = optimize_route(pois, constraints, max_stops=max_stops, area_center=area_center)
+    plans = opt_result["plans"]
+    matrix = opt_result["matrix"]
     _log("optimize", f"生成 {len(plans)} 个方案")
 
     if not plans:
@@ -306,7 +310,7 @@ def optimize_route_node(state: PlannerState) -> dict:
     primary = plans[0]
     itinerary = {
         "blocks": _build_blocks(primary["route"]),
-        "connections": _build_connections(primary["route"]),
+        "connections": _build_connections(primary["route"], matrix, transport_mode),
         "total_duration": primary["score"].get("total_duration_s", 0) // 60,
         "total_price": primary["score"].get("total_cost", 0),
         "score": primary["score"].get("route_score", 0),
@@ -319,7 +323,7 @@ def optimize_route_node(state: PlannerState) -> dict:
         alt = {
             "name": plan["name"],
             "blocks": _build_blocks(plan["route"]),
-            "connections": _build_connections(plan["route"]),
+            "connections": _build_connections(plan["route"], matrix, transport_mode),
             "total_duration": plan["score"].get("total_duration_s", 0) // 60,
             "total_price": plan["score"].get("total_cost", 0),
         }
@@ -382,11 +386,13 @@ def _build_blocks(route: list[dict]) -> list[dict]:
     import json as _json
     blocks = []
     for poi in route:
+        category = poi.get("category", "")
         block = {
             "id": poi["id"],
             "name": poi["name"],
-            "category": poi.get("category", ""),
-            "icon": _get_category_icon(poi.get("category", "")),
+            "category": category,
+            "type": _get_frontend_type(category),
+            "icon": _get_category_icon(category),
             "duration": 60,
             "price": poi.get("avg_cost", 0),
             "rating": poi.get("rating", 0),
@@ -397,18 +403,47 @@ def _build_blocks(route: list[dict]) -> list[dict]:
     return blocks
 
 
-def _build_connections(route: list[dict]) -> list[dict]:
-    """构建路线连接"""
+def _get_frontend_type(category: str) -> str:
+    """将中文类别映射为前端 TYPE_COLORS 的英文 key"""
+    mapping = {
+        "咖啡": "cafe",
+        "餐厅": "food",
+        "景点": "scenic",
+        "展览": "exhibition",
+        "公园": "park",
+        "购物": "shopping",
+        "甜品": "food",
+        "夜景": "entertainment",
+    }
+    return mapping.get(category, "scenic")
+
+
+def _build_connections(route: list[dict], matrix: dict = None, mode: str = "walking") -> list[dict]:
+    """构建路线连接，使用真实路线矩阵"""
+    mode_label = {"walking": "步行", "bicycling": "骑行", "driving": "驾车"}.get(mode, "步行")
     connections = []
     for i in range(len(route) - 1):
-        conn = {
-            "from": route[i]["id"],
-            "to": route[i + 1]["id"],
-            "distance": "约500米",
-            "time": "约10分钟",
-            "mode": "步行",
-        }
-        connections.append(conn)
+        from_id = route[i]["id"]
+        to_id = route[i + 1]["id"]
+        key = (from_id, to_id)
+
+        if matrix and key in matrix:
+            dist_m = matrix[key]["distance_m"]
+            dur_s = matrix[key]["duration_s"]
+            distance = f"{dist_m}m" if dist_m < 1000 else f"{dist_m / 1000:.1f}km"
+            minutes = dur_s // 60
+            time = f"{minutes}分钟" if minutes < 60 else f"{minutes // 60}小时{minutes % 60}分钟"
+        else:
+            distance = "未知"
+            time = "未知"
+
+        connections.append({
+            "from": from_id,
+            "to": to_id,
+            "distance": distance,
+            "time": time,
+            "mode": mode_label,
+        })
     return connections
 
 

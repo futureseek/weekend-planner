@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { apiPost } from "@/lib/api";
 
 export interface ItineraryBlock {
   id: string;
@@ -9,8 +10,11 @@ export interface ItineraryBlock {
   name: string;
   duration: number;
   price: number;
-  recommendation: string;
+  recommendation?: string;
+  reason?: string;
   address: string;
+  rating?: number;
+  tags?: string[];
 }
 
 export interface Connection {
@@ -34,6 +38,7 @@ const TYPE_COLORS: Record<string, { bg: string; border: string; text: string }> 
   art:           { bg: "bg-blue-50",    border: "border-blue-200",    text: "text-blue-700" },
   museum:        { bg: "bg-blue-50",    border: "border-blue-200",    text: "text-blue-700" },
   exhibition:    { bg: "bg-blue-50",    border: "border-blue-200",    text: "text-blue-700" },
+  scenic:        { bg: "bg-teal-50",    border: "border-teal-200",    text: "text-teal-700" },
   park:          { bg: "bg-green-50",   border: "border-green-200",   text: "text-green-700" },
   nature:        { bg: "bg-green-50",   border: "border-green-200",   text: "text-green-700" },
   walk:          { bg: "bg-green-50",   border: "border-green-200",   text: "text-green-700" },
@@ -45,24 +50,54 @@ const TYPE_COLORS: Record<string, { bg: string; border: string; text: string }> 
 
 const DEFAULT_COLOR = { bg: "bg-gray-50", border: "border-gray-200", text: "text-gray-700" };
 
-function getTypeColor(type: string) {
-  return TYPE_COLORS[type.toLowerCase()] || DEFAULT_COLOR;
+function getTypeColor(type?: string) {
+  return type ? TYPE_COLORS[type.toLowerCase()] || DEFAULT_COLOR : DEFAULT_COLOR;
 }
 
 interface CanvasProps {
   itinerary: Itinerary | null;
   onClose: () => void;
+  onItineraryUpdate?: (itinerary: Itinerary) => void;
+  onAdjustResult?: (userMsg: string, reply: string, itinerary?: Itinerary) => void;
 }
 
-export default function Canvas({ itinerary, onClose }: CanvasProps) {
+export default function Canvas({ itinerary, onClose, onItineraryUpdate, onAdjustResult }: CanvasProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [blocks, setBlocks] = useState<ItineraryBlock[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [adjusting, setAdjusting] = useState<string | null>(null);
   const [lineCoords, setLineCoords] = useState<
     { fromId: string; toId: string; distance: string; x: number; y1: number; y2: number }[]
   >([]);
   const containerRef = useRef<HTMLDivElement>(null);
   const prevItineraryRef = useRef<Itinerary | null>(null);
+
+  const ACTION_MESSAGES: Record<string, string> = {
+    less_walking: "我不想走太多路，请帮我重新规划，选近一点的地点",
+    lower_budget: "请帮我省钱，降低预算重新规划",
+    replace_poi: "请帮我换掉行程中的餐厅",
+  };
+
+  const handleAdjust = async (action: string) => {
+    const userMsg = ACTION_MESSAGES[action] || `请帮我调整行程：${action}`;
+    setAdjusting(action);
+    try {
+      const data = await apiPost<{ message: string; reply: string; itinerary?: Itinerary }>(
+        "/api/itinerary/adjust",
+        { action, session_id: "default", payload: {} }
+      );
+      if (data.itinerary) {
+        setBlocks(data.itinerary.blocks);
+        setConnections(data.itinerary.connections);
+        onItineraryUpdate?.(data.itinerary);
+      }
+      onAdjustResult?.(data.message || userMsg, data.reply, data.itinerary);
+    } catch (e) {
+      console.error("Adjust failed:", e);
+    } finally {
+      setAdjusting(null);
+    }
+  };
 
   useEffect(() => {
     if (itinerary && itinerary !== prevItineraryRef.current) {
@@ -210,7 +245,7 @@ export default function Canvas({ itinerary, onClose }: CanvasProps) {
               </span>
             </div>
           </div>
-          <p className="text-sm text-gray-600 mb-1">{selectedBlock.recommendation}</p>
+          <p className="text-sm text-gray-600 mb-1">{selectedBlock.reason || selectedBlock.recommendation}</p>
           <div className="flex gap-4 text-xs text-gray-500">
             <span>⏱ {selectedBlock.duration}分钟</span>
             <span>💰 ¥{selectedBlock.price}</span>
@@ -218,6 +253,28 @@ export default function Canvas({ itinerary, onClose }: CanvasProps) {
           </div>
         </div>
       )}
+
+      {/* Adjustment buttons */}
+      <div className="border-t bg-white px-4 py-2 flex gap-2 flex-wrap shrink-0">
+        {([
+          { key: "less_walking", label: "少走路" },
+          { key: "lower_budget", label: "省钱" },
+          { key: "replace_poi", label: "换餐厅" },
+        ]).map((btn) => (
+          <button
+            key={btn.key}
+            onClick={() => handleAdjust(btn.key)}
+            disabled={adjusting !== null}
+            className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
+              adjusting === btn.key
+                ? "bg-blue-100 border-blue-300 text-blue-600"
+                : "border-gray-200 text-gray-600 hover:bg-gray-50 hover:border-gray-300"
+            } disabled:opacity-50 disabled:cursor-not-allowed`}
+          >
+            {adjusting === btn.key ? "调整中..." : btn.label}
+          </button>
+        ))}
+      </div>
 
       {/* Footer */}
       <div className="border-t bg-white px-4 py-2 flex justify-between text-xs text-gray-500 shrink-0">

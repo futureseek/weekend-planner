@@ -66,7 +66,10 @@ def generate_itinerary(message: str, llm, user_id: str = "default") -> dict:
     print(f"[itinerary] UGC 补全完成")
 
     # 6. 路线优化
-    plans = optimize_route(pois, constraints, max_stops=5)
+    opt_result = optimize_route(pois, constraints, max_stops=5,
+                                area_center=area_info.get("center"))
+    plans = opt_result["plans"]
+    matrix = opt_result["matrix"]
     print(f"[itinerary] 路线优化完成: {len(plans)} 个方案")
 
     if not plans:
@@ -87,10 +90,11 @@ def generate_itinerary(message: str, llm, user_id: str = "default") -> dict:
     itinerary_id = f"itn_{uuid.uuid4().hex[:8]}"
     primary_plan = plans[0]
 
+    transport_mode = constraints.get("transport_mode", "walking")
     result = {
         "id": itinerary_id,
         "blocks": _build_blocks(primary_plan["route"]),
-        "connections": _build_connections(primary_plan["route"]),
+        "connections": _build_connections(primary_plan["route"], matrix, transport_mode),
         "total_duration": primary_plan["score"].get("total_duration_s", 0) // 60,
         "total_price": primary_plan["score"].get("total_cost", 0),
         "score": primary_plan["score"].get("route_score", 0),
@@ -102,7 +106,7 @@ def generate_itinerary(message: str, llm, user_id: str = "default") -> dict:
         alt = {
             "name": plan["name"],
             "blocks": _build_blocks(plan["route"]),
-            "connections": _build_connections(plan["route"]),
+            "connections": _build_connections(plan["route"], matrix, transport_mode),
             "total_duration": plan["score"].get("total_duration_s", 0) // 60,
             "total_price": plan["score"].get("total_cost", 0),
             "score": plan["score"].get("route_score", 0),
@@ -219,18 +223,32 @@ def _build_blocks(route: list[dict]) -> list[dict]:
     return blocks
 
 
-def _build_connections(route: list[dict]) -> list[dict]:
-    """构建路线连接数据"""
+def _build_connections(route: list[dict], matrix: dict = None, mode: str = "walking") -> list[dict]:
+    """构建路线连接数据，使用真实路线矩阵"""
+    mode_label = {"walking": "步行", "bicycling": "骑行", "driving": "驾车"}.get(mode, "步行")
     connections = []
     for i in range(len(route) - 1):
-        conn = {
-            "from": route[i]["id"],
-            "to": route[i + 1]["id"],
-            "distance": "约500米",
-            "time": "约10分钟",
-            "mode": "步行",
-        }
-        connections.append(conn)
+        from_id = route[i]["id"]
+        to_id = route[i + 1]["id"]
+        key = (from_id, to_id)
+
+        if matrix and key in matrix:
+            dist_m = matrix[key]["distance_m"]
+            dur_s = matrix[key]["duration_s"]
+            distance = f"{dist_m}m" if dist_m < 1000 else f"{dist_m / 1000:.1f}km"
+            minutes = dur_s // 60
+            time = f"{minutes}分钟" if minutes < 60 else f"{minutes // 60}小时{minutes % 60}分钟"
+        else:
+            distance = "未知"
+            time = "未知"
+
+        connections.append({
+            "from": from_id,
+            "to": to_id,
+            "distance": distance,
+            "time": time,
+            "mode": mode_label,
+        })
     return connections
 
 

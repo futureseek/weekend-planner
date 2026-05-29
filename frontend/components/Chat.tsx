@@ -20,9 +20,10 @@ const LOADING_TEXTS = [
 
 interface ChatProps {
   onItinerary: (itinerary: Itinerary | null) => void;
+  onReady?: (sendMessage: (text: string) => void, addExternalMessage: (userMsg: string, reply: string) => void) => void;
 }
 
-export default function Chat({ onItinerary }: ChatProps) {
+export default function Chat({ onItinerary, onReady }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -44,18 +45,29 @@ export default function Chat({ onItinerary }: ChatProps) {
     return () => clearInterval(timer);
   }, [loading]);
 
-  const sendMessage = async () => {
-    const text = input.trim();
-    if (!text || loading) return;
+  const addExternalMessage = (userMsg: string, reply: string) => {
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: userMsg },
+      { role: "assistant", content: reply },
+    ]);
+  };
 
-    setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: text }]);
+  useEffect(() => {
+    onReady?.(sendText, addExternalMessage);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const sendText = async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || loading) return;
+
+    setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
     setLoading(true);
 
     try {
       const data = await apiPost<{ reply: string; itinerary?: Itinerary }>(
         "/api/chat",
-        { message: text, session_id: "default" }
+        { message: trimmed, session_id: "default" }
       );
       setMessages((prev) => [
         ...prev,
@@ -73,6 +85,12 @@ export default function Chat({ onItinerary }: ChatProps) {
     } finally {
       setLoading(false);
     }
+  };
+
+  const sendMessage = async () => {
+    const text = input;
+    setInput("");
+    await sendText(text);
   };
 
   return (
