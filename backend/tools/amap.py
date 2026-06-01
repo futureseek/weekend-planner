@@ -12,6 +12,113 @@ AMAP_KEY = _config.get("amap_key", "")
 BASE_URL = "https://restapi.amap.com/v3"
 
 
+def _amap_get(path: str, params: dict, timeout: int = 8) -> dict:
+    payload = {"key": AMAP_KEY, **{k: v for k, v in params.items() if v not in (None, "")}}
+    res = requests.get(f"{BASE_URL}{path}", params=payload, timeout=timeout)
+    return res.json()
+
+
+def _normalize_text(value) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value if item)
+    return str(value or "")
+
+
+def _extract_poi(poi: dict) -> dict:
+    biz = poi.get("biz_ext", {}) or {}
+    return {
+        "id": poi.get("id"),
+        "name": poi.get("name"),
+        "address": _normalize_text(poi.get("address")),
+        "rating": biz.get("rating", ""),
+        "cost": biz.get("cost", ""),
+        "location": poi.get("location"),
+        "type": poi.get("type"),
+        "adcode": poi.get("adcode"),
+        "pname": poi.get("pname"),
+        "cityname": _normalize_text(poi.get("cityname")),
+        "adname": _normalize_text(poi.get("adname")),
+    }
+
+
+@tool
+def geocode_location(address: str, city: str = "") -> str:
+    """把全国任意城市、区县、景区或地址解析为高德坐标和 adcode。"""
+    data = _amap_get("/geocode/geo", {"address": address, "city": city}, timeout=8)
+    if data.get("status") != "1":
+        return json.dumps({"error": data.get("info", "地理编码失败")}, ensure_ascii=False)
+
+    geocodes = []
+    for item in data.get("geocodes", [])[:5]:
+        geocodes.append({
+            "formatted_address": item.get("formatted_address"),
+            "country": item.get("country"),
+            "province": item.get("province"),
+            "city": _normalize_text(item.get("city")),
+            "district": _normalize_text(item.get("district")),
+            "adcode": item.get("adcode"),
+            "location": item.get("location"),
+            "level": item.get("level"),
+        })
+    return json.dumps(geocodes, ensure_ascii=False)
+
+
+@tool
+def reverse_geocode(location: str) -> str:
+    """把经纬度坐标解析为省市区地址。location 格式为"经度,纬度"。"""
+    data = _amap_get(
+        "/geocode/regeo",
+        {
+            "location": location,
+            "extensions": "base",
+            "radius": 1000,
+        },
+        timeout=8,
+    )
+    if data.get("status") != "1":
+        return json.dumps({"error": data.get("info", "逆地理编码失败")}, ensure_ascii=False)
+
+    regeocode = data.get("regeocode", {}) or {}
+    address = regeocode.get("addressComponent", {}) or {}
+    payload = {
+        "formatted_address": regeocode.get("formatted_address", ""),
+        "province": address.get("province", ""),
+        "city": _normalize_text(address.get("city")) or _normalize_text(address.get("province")),
+        "district": _normalize_text(address.get("district")),
+        "township": _normalize_text(address.get("township")),
+        "adcode": address.get("adcode", ""),
+        "location": location,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+@tool
+def district_search(keyword: str, subdistrict: int = 0) -> str:
+    """查询全国行政区，支持省、市、区县、县级市、自治州等名称。"""
+    data = _amap_get(
+        "/config/district",
+        {
+            "keywords": keyword,
+            "subdistrict": subdistrict,
+            "extensions": "base",
+        },
+        timeout=8,
+    )
+    if data.get("status") != "1":
+        return json.dumps({"error": data.get("info", "行政区查询失败")}, ensure_ascii=False)
+
+    districts = []
+    for item in data.get("districts", [])[:10]:
+        districts.append({
+            "name": item.get("name"),
+            "adcode": item.get("adcode"),
+            "center": item.get("center"),
+            "level": item.get("level"),
+            "citycode": item.get("citycode"),
+        })
+    return json.dumps(districts, ensure_ascii=False)
+
+
 @tool
 def search_poi(keyword: str, city: str, types: str = "") -> str:
     """搜索指定城市中的兴趣点（餐厅、咖啡店、景点等）。
@@ -25,34 +132,22 @@ def search_poi(keyword: str, city: str, types: str = "") -> str:
     Returns:
         JSON格式的地点列表，包含名称、地址、评分、人均消费、坐标
     """
-    url = f"{BASE_URL}/place/text"
     params = {
-        "key": AMAP_KEY,
         "keywords": keyword,
         "city": city,
-        "offset": 5,
+        "offset": 10,
         "page": 1,
+        "citylimit": "false",
     }
     if types:
         params["types"] = types
 
-    res = requests.get(url, params=params)
-    data = res.json()
+    data = _amap_get("/place/text", params, timeout=8)
 
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "请求失败")}, ensure_ascii=False)
 
-    pois = []
-    for poi in data.get("pois", [])[:5]:
-        biz = poi.get("biz_ext", {})
-        pois.append({
-            "name": poi.get("name"),
-            "address": poi.get("address"),
-            "rating": biz.get("rating", ""),
-            "cost": biz.get("cost", ""),
-            "location": poi.get("location"),
-            "type": poi.get("type"),
-        })
+    pois = [_extract_poi(poi) for poi in data.get("pois", [])[:10]]
 
     return json.dumps(pois, ensure_ascii=False)
 
@@ -69,33 +164,24 @@ def search_nearby(location: str, keyword: str, radius: int = 2000) -> str:
     Returns:
         JSON格式的地点列表，包含名称、地址、评分、距离、坐标
     """
-    url = f"{BASE_URL}/place/around"
     params = {
-        "key": AMAP_KEY,
         "location": location,
         "keywords": keyword,
         "radius": radius,
-        "offset": 5,
+        "offset": 10,
         "page": 1,
     }
 
-    res = requests.get(url, params=params)
-    data = res.json()
+    data = _amap_get("/place/around", params, timeout=8)
 
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "请求失败")}, ensure_ascii=False)
 
     pois = []
-    for poi in data.get("pois", [])[:5]:
-        biz = poi.get("biz_ext", {})
-        pois.append({
-            "name": poi.get("name"),
-            "address": poi.get("address"),
-            "rating": biz.get("rating", ""),
-            "cost": biz.get("cost", ""),
-            "distance": poi.get("distance"),
-            "location": poi.get("location"),
-        })
+    for poi in data.get("pois", [])[:10]:
+        item = _extract_poi(poi)
+        item["distance"] = poi.get("distance")
+        pois.append(item)
 
     return json.dumps(pois, ensure_ascii=False)
 
@@ -114,28 +200,20 @@ def batch_search_poi(keywords: list[str], city: str) -> str:
     """
     all_pois = []
     for kw in keywords:
-        url = f"{BASE_URL}/place/text"
         params = {
-            "key": AMAP_KEY,
             "keywords": kw,
             "city": city,
             "offset": 5,
             "page": 1,
+            "citylimit": "false",
         }
         try:
-            res = requests.get(url, params=params, timeout=5)
-            data = res.json()
+            data = _amap_get("/place/text", params, timeout=5)
             if data.get("status") == "1":
                 for poi in data.get("pois", [])[:5]:
-                    biz = poi.get("biz_ext", {})
-                    all_pois.append({
-                        "name": poi.get("name"),
-                        "address": poi.get("address"),
-                        "rating": biz.get("rating", ""),
-                        "cost": biz.get("cost", ""),
-                        "location": poi.get("location"),
-                        "keyword": kw,
-                    })
+                    item = _extract_poi(poi)
+                    item["keyword"] = kw
+                    all_pois.append(item)
         except Exception:
             pass
 
@@ -207,4 +285,4 @@ def plan_route(locations: list[str], names: list[str] = []) -> str:
 
 def get_all_tools():
     """返回所有可用的工具列表"""
-    return [search_poi, search_nearby, batch_search_poi, plan_route]
+    return [geocode_location, reverse_geocode, district_search, search_poi, search_nearby, batch_search_poi, plan_route]

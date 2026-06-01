@@ -34,6 +34,8 @@ class PlannerState(TypedDict):
     candidate_pois: list[dict]
     area_info: dict | None
     alternative_plans: list[dict]
+    event_suggestions: list[dict]
+    guide_signals: dict
 
     # 修改动作
     modify_action: str | None

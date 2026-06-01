@@ -1,11 +1,13 @@
 import json
 from tools.tavily import search_reviews
+from tools.xhs_ugc import search_xhs_public_notes
 from db.database import execute_query, execute_one, execute_write
 
 # 关键词分类
 POSITIVE_KEYWORDS = ["推荐", "好吃", "好看", "出片", "安静", "性价比", "必去", "打卡", "环境好", "服务好"]
 NEGATIVE_KEYWORDS = ["排队", "拥挤", "难吃", "服务差", "贵", "踩雷", "避雷", "失望"]
 QUEUE_KEYWORDS = ["排队", "等位", "人多", "火爆", "网红"]
+XHS_TRIGGER_KEYWORDS = ["小红书", "种草", "避雷", "攻略", "网红", "出片"]
 
 
 def get_review_summary(poi_id: str) -> dict | None:
@@ -45,20 +47,55 @@ def detect_queue_risk(content: str) -> str:
     return "low"
 
 
-def search_and_save_reviews(poi_name: str, city: str, poi_id: str) -> dict | None:
-    """搜索评价并保存到数据库"""
-    query = f"{city} {poi_name} 推荐 排队 评价"
-    result = search_reviews.invoke({"query": query})
+def build_local_review(poi: dict) -> dict:
+    """用已有标签和评分生成轻量评价摘要，避免新城市逐个远程搜索导致接口阻塞。"""
+    tags = poi.get("tags", [])
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except json.JSONDecodeError:
+            tags = [tags]
+    tags = tags if isinstance(tags, list) else []
+    content = " ".join(str(tag) for tag in tags)
+    keywords = extract_keywords(content)
+    rating = poi.get("rating") or 0
+    try:
+        rating = float(rating)
+    except (TypeError, ValueError):
+        rating = 0
+    sentiment = 0.25 if rating >= 4.5 else 0.1 if rating >= 4.0 else 0
+    return {
+        "keywords": keywords,
+        "sentiment": sentiment,
+        "queue_hint": detect_queue_risk(content),
+        "content": content[:200],
+    }
 
+
+def _parse_remote_items(result) -> list[dict]:
     try:
         data = json.loads(result) if isinstance(result, str) else result
     except json.JSONDecodeError:
+        return []
+
+    if isinstance(data, dict) and "error" in data:
+        return []
+
+    return data if isinstance(data, list) else data.get("results", [])
+
+
+def search_and_save_reviews(poi_name: str, city: str, poi_id: str, source: str = "public_search") -> dict | None:
+    """搜索评价并保存到数据库"""
+    query = f"{city} {poi_name} 推荐 排队 评价"
+    try:
+        if source == "xhs":
+            result = search_xhs_public_notes.invoke({"query": f"{city} {poi_name}", "limit": 5})
+        else:
+            result = search_reviews.invoke({"query": query})
+    except Exception:
         return None
 
-    if "error" in data:
-        return None
-
-    items = data if isinstance(data, list) else data.get("results", [])
+    items = _parse_remote_items(result)
     if not items:
         return None
 
@@ -77,7 +114,7 @@ def search_and_save_reviews(poi_name: str, city: str, poi_id: str) -> dict | Non
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         poi_id,
-        "tavily",
+        "xhs_search" if source == "xhs" else "tavily",
         title,
         url,
         combined_content[:500],
@@ -97,9 +134,15 @@ def search_and_save_reviews(poi_name: str, city: str, poi_id: str) -> dict | Non
     }
 
 
-def enrich_reviews(pois: list[dict]) -> list[dict]:
+def enrich_reviews(
+    pois: list[dict],
+    fetch_remote: bool = False,
+    remote_limit: int = 3,
+    remote_source: str = "public_search",
+) -> list[dict]:
     """为 POI 列表补全评价信息"""
     enriched = []
+    remote_used = 0
     for poi in pois:
         poi_id = poi["id"]
 
@@ -113,17 +156,20 @@ def enrich_reviews(pois: list[dict]) -> list[dict]:
                 "content": review["content"],
             }
         else:
-            # 从 Tavily 搜索
-            result = search_and_save_reviews(poi["name"], poi.get("city", ""), poi_id)
+            # 默认不逐个远程搜索，避免任意城市规划时接口卡死；需要时只抓少量候选。
+            result = None
+            if fetch_remote and remote_used < remote_limit:
+                result = search_and_save_reviews(
+                    poi["name"],
+                    poi.get("city", ""),
+                    poi_id,
+                    source=remote_source,
+                )
+                remote_used += 1
             if result:
                 poi["review"] = result
             else:
-                poi["review"] = {
-                    "keywords": [],
-                    "sentiment": 0,
-                    "queue_hint": "unknown",
-                    "content": "",
-                }
+                poi["review"] = build_local_review(poi)
 
         enriched.append(poi)
 

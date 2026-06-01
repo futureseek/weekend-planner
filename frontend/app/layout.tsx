@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "周末去哪儿 · AI行程规划助手",
-  description: "用聊天的方式描述出行需求，AI生成行程方案",
+  title: "Roam 漫游 · AI路线规划",
+  description: "用聊天的方式描述出行需求，Roam 生成多方案路线",
 };
 
 export default function RootLayout({

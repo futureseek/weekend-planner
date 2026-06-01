@@ -24,6 +24,8 @@ DEFAULT_STATE = {
     "candidate_pois": [],
     "area_info": None,
     "alternative_plans": [],
+    "event_suggestions": [],
+    "guide_signals": {},
     "modify_action": None,
     "modify_payload": None,
 }
@@ -62,6 +64,7 @@ class ChatService:
         return {
             "reply": reply,
             "itinerary": result.get("itinerary"),
+            "alternatives": result.get("alternative_plans", []),
             "intent": result.get("intent"),
         }
 
@@ -173,4 +176,5 @@ class ChatService:
             "message": message,
             "reply": reply or "已重新规划行程！",
             "itinerary": result.get("itinerary"),
+            "alternatives": result.get("alternative_plans", []),
         }

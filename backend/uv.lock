@@ -1258,7 +1258,7 @@ wheels = [
 ]
 
 [[package]]
-name = "weekend-planner-backend"
+name = "roam-backend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
