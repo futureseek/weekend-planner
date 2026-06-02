@@ -10,7 +10,7 @@ type MarkdownBlock =
 
 function renderInline(text: string): ReactNode[] {
   const nodes: ReactNode[] = [];
-  const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/g;
+  const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\)|https?:\/\/[^\s)）]+)/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -34,6 +34,18 @@ function renderInline(text: string): ReactNode[] {
         >
           {token.slice(1, -1)}
         </code>
+      );
+    } else if (token.startsWith("http://") || token.startsWith("https://")) {
+      nodes.push(
+        <a
+          key={`${match.index}-url`}
+          href={token}
+          target="_blank"
+          rel="noreferrer"
+          className="break-all font-medium text-blue-600 underline decoration-blue-200 underline-offset-2 hover:text-blue-700"
+        >
+          {token}
+        </a>
       );
     } else {
       const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);

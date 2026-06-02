@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,15 +10,16 @@ from tools.amap import search_nearby, search_poi
 PREFERENCE_KEYWORDS = {
     "探店": ["咖啡店", "特色小店", "甜品"],
     "看展": ["美术馆", "博物馆", "展览"],
-    "美食": ["餐厅", "本地菜", "小吃"],
+    "美食": ["老字号粤菜", "广式早茶", "酒家", "高分餐厅", "餐厅", "本地菜", "小吃"],
     "亲子": ["公园", "亲子乐园", "博物馆"],
-    "夜景": ["夜景", "酒吧", "观景台"],
+    "夜景": ["夜景", "酒吧", "Livehouse", "演出", "观景台"],
     "咖啡": ["咖啡店", "咖啡馆"],
-    "购物": ["商场", "购物中心", "步行街"],
+    "购物": ["购物中心", "商场", "步行街", "买手店"],
     "自然": ["公园", "景区", "湖"],
     "爬山": ["登山步道", "森林公园", "山", "风景区"],
     "户外": ["森林公园", "露营地", "徒步", "骑行公园"],
     "运动": ["运动馆", "攀岩馆", "骑行", "篮球馆"],
+    "娱乐": ["演出", "Livehouse", "市集", "剧场", "娱乐", "游乐"],
     "游戏": ["电竞馆", "电玩", "密室逃脱", "剧本杀", "桌游吧", "网咖"],
     "热闹": ["商圈", "步行街", "夜景"],
     "拍照": ["景点", "美术馆", "网红打卡"],
@@ -34,6 +36,7 @@ PREFERENCE_CATEGORIES = {
     "爬山": ["公园", "景点"],
     "户外": ["公园", "景点"],
     "运动": ["娱乐", "公园"],
+    "娱乐": ["娱乐", "夜景", "购物"],
     "游戏": ["娱乐", "购物"],
     "购物": ["购物"],
     "亲子": ["公园", "展览", "景点"],
@@ -288,13 +291,18 @@ def search_or_fetch_pois(
     area: str | None = None,
     adcode: str | None = None,
     center: str | None = None,
+    radius_m: int | None = None,
 ) -> list[dict]:
     city = _normalize_city(city)
     local_pois = search_pois_by_preferences(city, preferences, max_cost, limit)
     local_pois = [poi for poi in local_pois if not _is_noise_poi(poi)]
+    local_pois = _filter_pois_by_center(local_pois, center, radius_m or 50000)
 
     local_categories = {poi.get("category") for poi in local_pois}
-    if len(local_pois) >= min(8, limit) and len(local_categories) >= 4:
+    has_visit_category = bool(local_categories & {"景点", "展览", "公园"})
+    has_food_or_rest = bool(local_categories & {"餐厅", "甜品", "咖啡"})
+    has_experience = bool(local_categories & {"购物", "娱乐", "夜景"})
+    if len(local_pois) >= min(8, limit) and len(local_categories) >= 5 and has_visit_category and has_food_or_rest and has_experience:
         return _diversify_pois(_dedupe_pois(local_pois), limit)
 
     keywords_to_search = _build_search_keywords(preferences, area)
@@ -321,13 +329,48 @@ def search_or_fetch_pois(
                 fetched_pois.append(poi)
                 seen_names.add(poi["name"])
 
-    combined = _dedupe_pois(local_pois + fetched_pois)
+    combined = _filter_pois_by_center(_dedupe_pois(local_pois + fetched_pois), center, radius_m or 50000)
 
     if len(combined) < min(6, limit):
         _ensure_fallback_city_pois(city)
-        combined = _dedupe_pois(combined + search_local_pois(city=city, max_cost=max_cost, limit=limit))
+        combined = _filter_pois_by_center(
+            _dedupe_pois(combined + search_local_pois(city=city, max_cost=max_cost, limit=limit)),
+            center,
+            radius_m or 50000,
+        )
 
     return _diversify_pois(combined, limit)
+
+
+def _filter_pois_by_center(pois: list[dict], center: str | None, radius_m: int = 50000) -> list[dict]:
+    if not center or "," not in center:
+        return pois
+    try:
+        center_lng, center_lat = [float(part) for part in center.split(",", 1)]
+    except (TypeError, ValueError):
+        return pois
+
+    filtered = []
+    for poi in pois:
+        try:
+            lng = float(poi.get("lng"))
+            lat = float(poi.get("lat"))
+        except (TypeError, ValueError):
+            filtered.append(poi)
+            continue
+        if _distance_m(lng, lat, center_lng, center_lat) <= radius_m:
+            filtered.append(poi)
+    return filtered
+
+
+def _distance_m(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
+    radius = 6371000
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    value = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return radius * 2 * math.atan2(math.sqrt(value), math.sqrt(1 - value))
 
 
 def _build_search_keywords(preferences: list[str] | None, area: str | None = None) -> list[str]:
@@ -336,14 +379,14 @@ def _build_search_keywords(preferences: list[str] | None, area: str | None = Non
         keywords.extend(PREFERENCE_KEYWORDS.get(pref, [pref]))
 
     # 保证没有偏好或偏好很窄时，也能形成“玩、吃、休息、消费”四类候选。
-    core_keywords = ["景点", "餐厅", "咖啡店", "甜品", "商场", "博物馆", "公园", "小吃", "夜市", "娱乐"]
+    core_keywords = ["景点", "餐厅", "咖啡店", "甜品", "商场", "博物馆", "公园", "小吃", "夜市", "娱乐", "演出", "市集"]
     keywords.extend(core_keywords)
     keywords = list(dict.fromkeys(k for k in keywords if k))
 
     if area:
         area = area.strip()
         area_keywords = [f"{area} {keyword}" for keyword in keywords[:5] if area not in keyword]
-        area_keywords.extend([f"{area} {keyword}" for keyword in ["餐厅", "咖啡店", "甜品", "小吃", "商场", "电竞馆", "森林公园"]])
+        area_keywords.extend([f"{area} {keyword}" for keyword in ["餐厅", "咖啡店", "甜品", "小吃", "商场", "电竞馆", "森林公园", "演出", "市集"]])
         keywords = area_keywords + core_keywords + keywords
 
     return list(dict.fromkeys(keywords))[:12]
@@ -393,13 +436,22 @@ def _amap_search_with_fallback(
 
 def _dedupe_pois(pois: list[dict]) -> list[dict]:
     result = []
-    seen = set()
+    seen_ids = set()
+    seen_names = set()
     for poi in pois:
-        if not poi or poi.get("id") in seen or _is_noise_poi(poi):
+        if not poi or _is_noise_poi(poi):
+            continue
+        name_key = _normalize_poi_name(poi.get("name", ""))
+        if poi.get("id") in seen_ids or name_key in seen_names:
             continue
         result.append(poi)
-        seen.add(poi.get("id"))
+        seen_ids.add(poi.get("id"))
+        seen_names.add(name_key)
     return result
+
+
+def _normalize_poi_name(name: str) -> str:
+    return re.sub(r"\s+", "", str(name or "").lower())
 
 
 def _diversify_pois(pois: list[dict], limit: int) -> list[dict]:
@@ -453,6 +505,8 @@ def _is_noise_poi(poi: dict) -> bool:
     noise_words = [
         "公交站", "地铁站", "停车场", "停车位", "出入口", "卫生间", "售票处", "检票口", "服务区",
         "酒店", "民宿", "客栈", "宾馆", "旅馆", "住宿", "公寓", "售楼处", "房产小区",
+        "演出公司", "演出设备", "演出器材", "设备租赁", "器材租赁", "灯光音响", "舞台设备",
+        "有限公司", "科技公司", "餐饮管理", "企业管理", "文化传播",
     ]
     if any(word in text for word in noise_words):
         return True

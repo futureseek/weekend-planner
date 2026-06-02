@@ -41,6 +41,18 @@ def _extract_poi(poi: dict) -> dict:
     }
 
 
+def _extract_tip(tip: dict) -> dict:
+    return {
+        "id": tip.get("id", ""),
+        "name": tip.get("name", ""),
+        "address": _normalize_text(tip.get("address")),
+        "location": tip.get("location") if isinstance(tip.get("location"), str) else "",
+        "district": _normalize_text(tip.get("district")),
+        "adcode": tip.get("adcode", ""),
+        "typecode": tip.get("typecode", ""),
+    }
+
+
 @tool
 def geocode_location(address: str, city: str = "") -> str:
     """把全国任意城市、区县、景区或地址解析为高德坐标和 adcode。"""
@@ -61,6 +73,30 @@ def geocode_location(address: str, city: str = "") -> str:
             "level": item.get("level"),
         })
     return json.dumps(geocodes, ensure_ascii=False)
+
+
+@tool
+def input_tips(keyword: str, city: str = "") -> str:
+    """按用户输入返回全国 POI/地址联想候选，适合起点输入框。"""
+    data = _amap_get(
+        "/assistant/inputtips",
+        {
+            "keywords": keyword,
+            "city": city,
+            "citylimit": "true" if city else "false",
+            "datatype": "all",
+        },
+        timeout=8,
+    )
+    if data.get("status") != "1":
+        return json.dumps({"error": data.get("info", "输入提示查询失败")}, ensure_ascii=False)
+
+    tips = []
+    for tip in data.get("tips", [])[:12]:
+        item = _extract_tip(tip)
+        if item.get("name") and item.get("location"):
+            tips.append(item)
+    return json.dumps(tips, ensure_ascii=False)
 
 
 @tool
@@ -115,6 +151,16 @@ def district_search(keyword: str, subdistrict: int = 0) -> str:
             "center": item.get("center"),
             "level": item.get("level"),
             "citycode": item.get("citycode"),
+            "districts": [
+                {
+                    "name": child.get("name"),
+                    "adcode": child.get("adcode"),
+                    "center": child.get("center"),
+                    "level": child.get("level"),
+                    "citycode": child.get("citycode"),
+                }
+                for child in item.get("districts", [])
+            ],
         })
     return json.dumps(districts, ensure_ascii=False)
 
@@ -137,7 +183,7 @@ def search_poi(keyword: str, city: str, types: str = "") -> str:
         "city": city,
         "offset": 10,
         "page": 1,
-        "citylimit": "false",
+        "citylimit": "true" if city else "false",
     }
     if types:
         params["types"] = types
@@ -205,7 +251,7 @@ def batch_search_poi(keywords: list[str], city: str) -> str:
             "city": city,
             "offset": 5,
             "page": 1,
-            "citylimit": "false",
+            "citylimit": "true" if city else "false",
         }
         try:
             data = _amap_get("/place/text", params, timeout=5)
@@ -283,6 +329,48 @@ def plan_route(locations: list[str], names: list[str] = []) -> str:
     return json.dumps(routes, ensure_ascii=False)
 
 
+def fetch_direction_polyline(origin: str, destination: str, mode: str = "walking") -> list[dict]:
+    """Return route geometry from AMap for map rendering.
+
+    Public transit is intentionally not handled here because AMap transit needs
+    city-specific transfer parsing. Callers should fall back to straight lines.
+    """
+    endpoint_map = {
+        "walking": "/direction/walking",
+        "bicycling": "/direction/bicycling",
+        "driving": "/direction/driving",
+    }
+    endpoint = endpoint_map.get(mode)
+    if not endpoint or not origin or not destination:
+        return []
+
+    try:
+        data = _amap_get(endpoint, {"origin": origin, "destination": destination}, timeout=5)
+    except Exception:
+        return []
+    if data.get("status") != "1":
+        return []
+
+    paths = (data.get("route") or {}).get("paths") or []
+    if not paths:
+        return []
+    points: list[dict] = []
+    for step in paths[0].get("steps") or []:
+        for token in str(step.get("polyline") or "").split(";"):
+            if "," not in token:
+                continue
+            lng, lat = token.split(",", 1)
+            try:
+                points.append({"lng": round(float(lng), 6), "lat": round(float(lat), 6)})
+            except ValueError:
+                continue
+    compact: list[dict] = []
+    for point in points:
+        if not compact or compact[-1] != point:
+            compact.append(point)
+    return compact[:220]
+
+
 def get_all_tools():
     """返回所有可用的工具列表"""
-    return [geocode_location, reverse_geocode, district_search, search_poi, search_nearby, batch_search_poi, plan_route]
+    return [geocode_location, input_tips, reverse_geocode, district_search, search_poi, search_nearby, batch_search_poi, plan_route]
