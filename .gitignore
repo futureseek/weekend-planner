@@ -44,3 +44,6 @@ backend/tests
 
 # claude
 .claude
+
+# cache
+./frontend/tsconfig.tsbuildinfo
