@@ -35,9 +35,15 @@ Thumbs.db
 
 # Logs
 *.log
-
+docs
 # apikey
 config
 
 # test 
 backend/tests
+
+# claude
+.claude
+
+# cache
+./frontend/tsconfig.tsbuildinfo
