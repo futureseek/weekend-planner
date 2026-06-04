@@ -6,7 +6,7 @@ from config import load_config
 from chat_service import ChatService
 from db.database import init_db
 from db.seed import seed_pois
-from tools.amap import reverse_geocode, district_search, geocode_location, input_tips, search_poi
+from tools.amap import reverse_geocode, district_search, geocode_location, input_tips, search_poi, fetch_nearest_anchor
 from tools.xhs_ugc import search_xhs_public_notes, read_public_webpage
 
 app = Flask(__name__)
@@ -40,10 +40,38 @@ CITY_ALIASES = {
     "urumqi": "乌鲁木齐",
 }
 
+COMMON_CITY_DISTRICTS = {
+    "广州": ["越秀区", "海珠区", "荔湾区", "天河区", "白云区", "黄埔区", "番禺区", "花都区", "南沙区", "从化区", "增城区"],
+    "深圳": ["福田区", "罗湖区", "南山区", "盐田区", "宝安区", "龙岗区", "龙华区", "坪山区", "光明区", "大鹏新区"],
+    "上海": ["黄浦区", "徐汇区", "长宁区", "静安区", "普陀区", "虹口区", "杨浦区", "闵行区", "宝山区", "嘉定区", "浦东新区", "金山区", "松江区", "青浦区", "奉贤区", "崇明区"],
+    "北京": ["东城区", "西城区", "朝阳区", "海淀区", "丰台区", "石景山区", "通州区", "昌平区", "大兴区", "顺义区", "房山区", "门头沟区", "怀柔区", "平谷区", "密云区", "延庆区"],
+    "杭州": ["上城区", "拱墅区", "西湖区", "滨江区", "萧山区", "余杭区", "临平区", "钱塘区", "富阳区", "临安区", "桐庐县", "淳安县", "建德市"],
+    "成都": ["锦江区", "青羊区", "金牛区", "武侯区", "成华区", "龙泉驿区", "青白江区", "新都区", "温江区", "双流区", "郫都区", "新津区", "都江堰市"],
+    "重庆": ["渝中区", "江北区", "南岸区", "九龙坡区", "沙坪坝区", "大渡口区", "渝北区", "巴南区", "北碚区", "两江新区"],
+    "武汉": ["江岸区", "江汉区", "硚口区", "汉阳区", "武昌区", "青山区", "洪山区", "东西湖区", "汉南区", "蔡甸区", "江夏区", "黄陂区", "新洲区"],
+    "南京": ["玄武区", "秦淮区", "建邺区", "鼓楼区", "浦口区", "栖霞区", "雨花台区", "江宁区", "六合区", "溧水区", "高淳区"],
+    "苏州": ["姑苏区", "虎丘区", "吴中区", "相城区", "吴江区", "工业园区", "常熟市", "张家港市", "昆山市", "太仓市"],
+    "西安": ["新城区", "碑林区", "莲湖区", "雁塔区", "未央区", "灞桥区", "长安区", "临潼区", "阎良区", "高陵区", "鄠邑区"],
+    "天津": ["和平区", "河东区", "河西区", "南开区", "河北区", "红桥区", "滨海新区", "东丽区", "西青区", "津南区", "北辰区", "武清区"],
+    "厦门": ["思明区", "海沧区", "湖里区", "集美区", "同安区", "翔安区"],
+    "青岛": ["市南区", "市北区", "李沧区", "崂山区", "城阳区", "黄岛区", "即墨区", "胶州市", "平度市", "莱西市"],
+}
+
+_DISTRICT_CACHE = {}
+_GEOCODE_CACHE = {}
+
 
 def normalize_city_name(city: str) -> str:
     value = (city or "").strip().replace("市", "")
     return CITY_ALIASES.get(value.lower(), value)
+
+
+def _fallback_districts(city: str) -> list[dict]:
+    names = COMMON_CITY_DISTRICTS.get(normalize_city_name(city), [])
+    return [
+        {"name": name, "adcode": "", "center": "", "level": "district"}
+        for name in names
+    ]
 
 
 def _text_value(value) -> str:
@@ -256,6 +284,35 @@ def reverse_location():
 
     result = reverse_geocode.invoke({"location": location})
     payload = json.loads(result)
+    if not payload.get("error"):
+        try:
+            anchor = fetch_nearest_anchor(location, radius=20)
+        except Exception:
+            anchor = None
+        if anchor:
+            original_location = payload.get("location") or location
+            payload.update({
+                "name": anchor.get("name", ""),
+                "address": anchor.get("address", ""),
+                "formatted_address": " ".join(
+                    part for part in [
+                        _text_value(anchor.get("pname")),
+                        _text_value(anchor.get("cityname")),
+                        _text_value(anchor.get("adname")),
+                        _text_value(anchor.get("name")),
+                    ] if part
+                ),
+                "city": _text_value(anchor.get("cityname")) or payload.get("city", ""),
+                "district": _text_value(anchor.get("adname")) or payload.get("district", ""),
+                "adcode": anchor.get("adcode") or payload.get("adcode", ""),
+                "location": anchor.get("location") or original_location,
+                "original_location": original_location,
+                "anchor_distance_m": anchor.get("distance_m"),
+                "source": "nearest_poi_20m",
+            })
+        else:
+            payload.setdefault("original_location", location)
+            payload.setdefault("source", "reverse_geocode")
     status = 400 if payload.get("error") else 200
     return jsonify(payload), status
 
@@ -269,12 +326,16 @@ def geocode():
     if not address:
         return jsonify({"error": "address is required"}), 400
 
+    cache_key = f"{city}|{address}".lower()
+    if cache_key in _GEOCODE_CACHE:
+        return jsonify({"items": _GEOCODE_CACHE[cache_key], "source": "cache"})
+
     items = []
     poi_queries = [(address, city)]
     if city:
-        poi_queries.append((address, ""))
         if city not in address:
             poi_queries.append((f"{city}{address}", ""))
+        poi_queries.append((address, ""))
 
     try:
         tip_payload = json.loads(input_tips.invoke({"keyword": address, "city": city}))
@@ -283,22 +344,27 @@ def geocode():
     except Exception:
         pass
 
-    try:
-        for query, query_city in poi_queries:
+    for query, query_city in poi_queries:
+        if len(_merge_location_items(items, address, city)) >= 6:
+            break
+        try:
             poi_payload = json.loads(search_poi.invoke({"keyword": query, "city": query_city}))
             if isinstance(poi_payload, list):
                 items.extend(item for item in (_poi_geocode_item(poi) for poi in poi_payload) if item)
-    except Exception:
-        pass
+        except Exception:
+            continue
 
-    try:
-        geo_payload = json.loads(geocode_location.invoke({"address": address, "city": city}))
-        if isinstance(geo_payload, list):
-            items.extend(item for item in (_geo_geocode_item(geo) for geo in geo_payload) if item)
-    except Exception:
-        pass
+    if len(_merge_location_items(items, address, city)) < 3:
+        try:
+            geo_payload = json.loads(geocode_location.invoke({"address": address, "city": city}))
+            if isinstance(geo_payload, list):
+                items.extend(item for item in (_geo_geocode_item(geo) for geo in geo_payload) if item)
+        except Exception:
+            pass
 
-    return jsonify({"items": _merge_location_items(items, address, city)[:8]})
+    merged = _merge_location_items(items, address, city)[:8]
+    _GEOCODE_CACHE[cache_key] = merged
+    return jsonify({"items": merged, "source": "amap" if merged else "empty"})
 
 
 @app.route("/api/location/districts", methods=["POST"])
@@ -309,10 +375,33 @@ def city_districts():
     if not city:
         return jsonify({"error": "city is required"}), 400
 
-    result = district_search.invoke({"keyword": city, "subdistrict": 1})
-    payload = json.loads(result)
+    if city in _DISTRICT_CACHE:
+        return jsonify(_DISTRICT_CACHE[city])
+
+    try:
+        result = district_search.invoke({"keyword": city, "subdistrict": 1})
+        payload = json.loads(result)
+    except Exception as exc:
+        fallback = _fallback_districts(city)
+        response = {
+            "city": city,
+            "districts": fallback,
+            "source": "fallback",
+            "warning": f"district API unavailable: {exc}",
+        }
+        _DISTRICT_CACHE[city] = response
+        return jsonify(response)
+
     if isinstance(payload, dict) and payload.get("error"):
-        return jsonify(payload), 400
+        fallback = _fallback_districts(city)
+        response = {
+            "city": city,
+            "districts": fallback,
+            "source": "fallback",
+            "warning": payload.get("error"),
+        }
+        _DISTRICT_CACHE[city] = response
+        return jsonify(response)
 
     districts = []
     for item in payload if isinstance(payload, list) else []:
@@ -336,7 +425,15 @@ def city_districts():
             "level": item.get("level", ""),
         })
 
-    return jsonify({"city": city, "districts": normalized})
+    if not normalized:
+        normalized = _fallback_districts(city)
+        source = "fallback"
+    else:
+        source = "amap"
+
+    response = {"city": city, "districts": normalized, "source": source}
+    _DISTRICT_CACHE[city] = response
+    return jsonify(response)
 
 
 @app.route("/api/ugc/xhs/search", methods=["POST"])

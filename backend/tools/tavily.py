@@ -5,7 +5,7 @@ from langchain_tavily import TavilySearch
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "api_config.json")
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
     _config = json.load(f)
 
 TAVILY_API_KEY = _config.get("tavily_key", "")

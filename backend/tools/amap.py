@@ -5,7 +5,7 @@ from langchain_core.tools import tool
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "api_config.json")
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
     _config = json.load(f)
 
 AMAP_KEY = _config.get("amap_key", "")
@@ -16,6 +16,66 @@ def _amap_get(path: str, params: dict, timeout: int = 8) -> dict:
     payload = {"key": AMAP_KEY, **{k: v for k, v in params.items() if v not in (None, "")}}
     res = requests.get(f"{BASE_URL}{path}", params=payload, timeout=timeout)
     return res.json()
+
+
+def fetch_transit_plan(origin: str, destination: str, city: str = "", cityd: str = "") -> dict | None:
+    """Return a compact Amap transit summary for one origin-destination pair."""
+    if not origin or not destination:
+        return None
+    data = _amap_get(
+        "/direction/transit/integrated",
+        {
+            "origin": origin,
+            "destination": destination,
+            "city": city,
+            "cityd": cityd or city,
+            "strategy": 0,
+            "nightflag": 1,
+            "extensions": "base",
+        },
+        timeout=5,
+    )
+    if data.get("status") != "1":
+        return None
+
+    transits = ((data.get("route") or {}).get("transits") or [])
+    if not transits:
+        return None
+    transit = transits[0] or {}
+    duration = int(float(transit.get("duration") or 0) // 60) if transit.get("duration") else 0
+    walking_distance = int(float(transit.get("walking_distance") or 0)) if transit.get("walking_distance") else 0
+    cost = transit.get("cost")
+    segments = []
+    for segment in transit.get("segments") or []:
+        bus = segment.get("bus") or {}
+        lines = bus.get("buslines") or []
+        if lines:
+            line = lines[0]
+            line_name = line.get("name") or "公交/地铁"
+            departure = ((line.get("departure_stop") or {}).get("name")) or ""
+            arrival = ((line.get("arrival_stop") or {}).get("name")) or ""
+            if departure or arrival:
+                segments.append(f"{line_name}: {departure} → {arrival}".strip())
+            else:
+                segments.append(line_name)
+            continue
+        walking = segment.get("walking") or {}
+        walk_distance = walking.get("distance")
+        if walk_distance:
+            try:
+                meters = int(float(walk_distance))
+                segments.append(f"步行 {meters}m")
+            except (TypeError, ValueError):
+                pass
+    summary = " → ".join(segments[:3]) if segments else "公共交通方案"
+    return {
+        "summary": summary,
+        "duration": f"{duration}分钟" if duration else "",
+        "walking_distance": f"{walking_distance}m" if walking_distance else "",
+        "cost": f"¥{cost}" if cost not in (None, "") else "",
+        "segments": segments[:6],
+        "source": "amap_transit",
+    }
 
 
 def _normalize_text(value) -> str:
@@ -41,6 +101,44 @@ def _extract_poi(poi: dict) -> dict:
     }
 
 
+def fetch_nearest_anchor(location: str, radius: int = 20) -> dict | None:
+    """Find the nearest named POI around a browser coordinate for a concrete transit origin."""
+    if not location:
+        return None
+    data = _amap_get(
+        "/place/around",
+        {
+            "location": location,
+            "radius": max(10, min(int(radius or 20), 50)),
+            "sortrule": "distance",
+            "offset": 10,
+            "page": 1,
+            "extensions": "base",
+        },
+        timeout=4,
+    )
+    if data.get("status") != "1":
+        return None
+    candidates = []
+    for poi in data.get("pois", []) or []:
+        name = _normalize_text(poi.get("name"))
+        poi_location = poi.get("location")
+        if not name or not poi_location:
+            continue
+        try:
+            distance = int(float(poi.get("distance") or 999999))
+        except (TypeError, ValueError):
+            distance = 999999
+        if distance <= radius:
+            item = _extract_poi(poi)
+            item["distance_m"] = distance
+            candidates.append(item)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item.get("distance_m", 999999), len(_normalize_text(item.get("name")))))
+    return candidates[0]
+
+
 def _extract_tip(tip: dict) -> dict:
     return {
         "id": tip.get("id", ""),
@@ -56,7 +154,7 @@ def _extract_tip(tip: dict) -> dict:
 @tool
 def geocode_location(address: str, city: str = "") -> str:
     """把全国任意城市、区县、景区或地址解析为高德坐标和 adcode。"""
-    data = _amap_get("/geocode/geo", {"address": address, "city": city}, timeout=8)
+    data = _amap_get("/geocode/geo", {"address": address, "city": city}, timeout=4)
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "地理编码失败")}, ensure_ascii=False)
 
@@ -86,7 +184,7 @@ def input_tips(keyword: str, city: str = "") -> str:
             "citylimit": "true" if city else "false",
             "datatype": "all",
         },
-        timeout=8,
+        timeout=3,
     )
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "输入提示查询失败")}, ensure_ascii=False)
@@ -109,7 +207,7 @@ def reverse_geocode(location: str) -> str:
             "extensions": "base",
             "radius": 1000,
         },
-        timeout=8,
+        timeout=4,
     )
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "逆地理编码失败")}, ensure_ascii=False)
@@ -138,7 +236,7 @@ def district_search(keyword: str, subdistrict: int = 0) -> str:
             "subdistrict": subdistrict,
             "extensions": "base",
         },
-        timeout=8,
+        timeout=4,
     )
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "行政区查询失败")}, ensure_ascii=False)
@@ -188,7 +286,7 @@ def search_poi(keyword: str, city: str, types: str = "") -> str:
     if types:
         params["types"] = types
 
-    data = _amap_get("/place/text", params, timeout=8)
+    data = _amap_get("/place/text", params, timeout=4)
 
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "请求失败")}, ensure_ascii=False)

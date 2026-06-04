@@ -26,7 +26,42 @@ NAME_COST_RULES = [
 ]
 
 QUALITY_FOOD_KEYWORDS = ("酒家", "食府", "茶楼", "粤菜", "海鲜", "老字号", "饭店", "私房菜", "茶点", "茶餐厅")
-LIGHT_FOOD_KEYWORDS = ("冰室", "糖水", "肠粉", "小食", "米糕", "粉", "面", "瑞幸", "蜜雪", "甜品", "肯德基", "KFC", "麦当劳", "汉堡王")
+LIGHT_FOOD_KEYWORDS = (
+    "冰室", "糖水", "肠粉", "小食", "米糕", "粉", "面", "瑞幸", "蜜雪", "甜品",
+    "肯德基", "KFC", "麦当劳", "汉堡王", "萨莉亚", "Saizeriya", "必胜客",
+)
+
+PREFERENCE_CATEGORY_BONUS = {
+    "美食": {"餐厅": 0.18, "甜品": 0.06},
+    "咖啡": {"咖啡": 0.18, "甜品": 0.04},
+    "探店": {"咖啡": 0.12, "甜品": 0.08, "购物": 0.06},
+    "看展": {"展览": 0.20, "景点": 0.06},
+    "自然": {"公园": 0.16, "景点": 0.12},
+    "爬山": {"公园": 0.18, "景点": 0.16},
+    "户外": {"公园": 0.18, "景点": 0.12, "娱乐": 0.04},
+    "运动": {"娱乐": 0.16, "公园": 0.08},
+    "游戏": {"娱乐": 0.22, "购物": 0.06},
+    "娱乐": {"娱乐": 0.18, "夜景": 0.08, "购物": 0.04},
+    "购物": {"购物": 0.20, "餐厅": 0.04},
+    "亲子": {"公园": 0.14, "展览": 0.14, "景点": 0.08},
+    "夜景": {"夜景": 0.22, "娱乐": 0.08},
+    "拍照": {"景点": 0.14, "展览": 0.10, "咖啡": 0.05},
+    "历史": {"展览": 0.16, "景点": 0.14},
+    "热闹": {"购物": 0.12, "夜景": 0.12, "娱乐": 0.08},
+    "休闲": {"咖啡": 0.12, "公园": 0.10, "甜品": 0.08, "娱乐": 0.06},
+}
+
+PREFERENCE_STYLE_RECIPES = {
+    "游戏": [("娱乐", 2), ("餐厅", 1), ("购物", 1), ("夜景", 1), ("咖啡", 1), ("甜品", 1)],
+    "爬山": [("公园", 2), ("景点", 2), ("餐厅", 1), ("咖啡", 1), ("夜景", 1)],
+    "户外": [("公园", 2), ("景点", 2), ("餐厅", 1), ("咖啡", 1), ("夜景", 1)],
+    "购物": [("购物", 2), ("餐厅", 1), ("咖啡", 1), ("甜品", 1), ("夜景", 1)],
+    "看展": [("展览", 2), ("咖啡", 1), ("餐厅", 1), ("景点", 1), ("夜景", 1)],
+    "历史": [("展览", 2), ("景点", 2), ("餐厅", 1), ("咖啡", 1)],
+    "亲子": [("公园", 2), ("展览", 1), ("景点", 1), ("餐厅", 1), ("甜品", 1)],
+    "夜景": [("景点", 1), ("餐厅", 1), ("娱乐", 1), ("夜景", 2), ("咖啡", 1)],
+    "休闲": [("餐厅", 1), ("咖啡", 1), ("公园", 1), ("甜品", 1), ("娱乐", 1), ("夜景", 1)],
+}
 
 
 def haversine_distance(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
@@ -135,9 +170,14 @@ def score_poi(poi: dict, constraints: dict, user_profile: dict = None, area_cent
     preferences = constraints.get("preferences", []) or []
     score = 0.0
     area_center = _parse_center(area_center)
+    tags = _safe_tags(poi)
+    poi_text = " ".join([str(poi.get("name") or ""), str(poi.get("category") or ""), str(poi.get("address") or ""), *map(str, tags)])
 
     preference_match = _preference_match_score(poi, preferences)
     score += 0.38 * preference_match
+    category = poi.get("category", "")
+    for pref in preferences:
+        score += PREFERENCE_CATEGORY_BONUS.get(pref, {}).get(category, 0)
 
     rating = _to_float(poi.get("rating"), 4.0)
     score += 0.16 * min(rating / 5.0, 1.0)
@@ -159,11 +199,22 @@ def score_poi(poi: dict, constraints: dict, user_profile: dict = None, area_cent
         cost_fit = 0.65
     score += 0.13 * cost_fit
 
-    if constraints.get("budget_level") in {"comfort", "premium"} and poi.get("category") in {"餐厅", "甜品", "咖啡"}:
+    if constraints.get("budget_level") in {"comfort", "premium"} and category in {"餐厅", "甜品", "咖啡"}:
         food_quality = _food_quality_signal(poi)
         score += 0.08 * food_quality
-        if poi.get("category") == "餐厅" and avg_cost and avg_cost < 50 and food_quality < 0:
+        if category == "餐厅" and avg_cost and avg_cost < 50 and food_quality < 0:
             score -= 0.08
+    if constraints.get("food_priority") == "quality" and category in {"餐厅", "甜品", "咖啡"}:
+        food_quality = _food_quality_signal(poi)
+        score += 0.18 * food_quality
+        if category == "餐厅" and any(keyword in poi_text for keyword in LIGHT_FOOD_KEYWORDS):
+            score -= 0.34
+        if category == "餐厅" and any(keyword in poi_text for keyword in QUALITY_FOOD_KEYWORDS):
+            score += 0.12
+        if category == "餐厅" and avg_cost and per_person_budget:
+            quality_floor = min(max(per_person_budget * 0.18, 70), 160)
+            if avg_cost >= quality_floor and avg_cost <= per_person_budget * 0.75:
+                score += 0.08
 
     if area_center and poi.get("lng") and poi.get("lat"):
         dist = haversine_distance(float(poi["lng"]), float(poi["lat"]), area_center[0], area_center[1])
@@ -178,12 +229,18 @@ def score_poi(poi: dict, constraints: dict, user_profile: dict = None, area_cent
     sentiment = _to_float(review.get("sentiment"), 0)
     keywords = review.get("keywords", []) if isinstance(review.get("keywords", []), list) else []
     hot_score = 0.55 + max(sentiment, 0) * 0.3
-    if any(kw in ["推荐", "必去", "打卡", "本地人推荐"] for kw in keywords + _safe_tags(poi)):
+    if any(kw in ["推荐", "必去", "打卡", "本地人推荐"] for kw in keywords + tags):
         hot_score += 0.12
+    guide_positive = constraints.get("guide_positive_keywords") or []
+    guide_avoid = constraints.get("guide_avoid_keywords") or []
+    review_text = str(review.get("content", "") or "")
+    if any(keyword in poi_text or keyword in review_text for keyword in guide_positive):
+        hot_score += 0.18
+    if any(keyword in poi_text or keyword in review.get("content", "") for keyword in guide_avoid):
+        hot_score -= 0.18
     score += 0.10 * min(hot_score, 1.0)
 
     queue_tolerance = constraints.get("queue_tolerance", 2)
-    tags = _safe_tags(poi)
     queue_hint = review.get("queue_hint", "unknown")
     if "排队" in tags or queue_hint == "high":
         queue_fit = 0.35 if queue_tolerance <= 1 else 0.65
@@ -418,7 +475,7 @@ def optimize_route(
     add_plan("综合推荐", "balanced", best, ["偏好匹配", "预算利用适中", "类型丰富"])
 
     walking = _route_item_from_direct_selection(
-        _direct_style_route(candidates, route_len, "short_walk"),
+        _direct_style_route(candidates, route_len, "short_walk", constraints),
         matrix,
         constraints,
     ) or min(
@@ -428,7 +485,7 @@ def optimize_route(
     add_plan("少走路", "short_walk", walking, ["地点更集中", "步行距离更短"], allow_similar=True)
 
     food_fun = _route_item_from_direct_selection(
-        _direct_style_route(candidates, route_len, "food_fun"),
+        _direct_style_route(candidates, route_len, "food_fun", constraints),
         matrix,
         constraints,
     ) or max(
@@ -443,7 +500,7 @@ def optimize_route(
 
     if constraints.get("budget_level") in {"comfort", "premium"}:
         premium = _route_item_from_direct_selection(
-            _direct_style_route(candidates, route_len, "premium"),
+            _direct_style_route(candidates, route_len, "premium", constraints),
             matrix,
             constraints,
         ) or max(
@@ -457,7 +514,7 @@ def optimize_route(
         add_plan("预算充分", "premium", premium, ["提高预算利用", "升级餐饮和体验"], allow_similar=True)
 
     low_budget = _route_item_from_direct_selection(
-        _direct_style_route(candidates, route_len, "budget"),
+        _direct_style_route(candidates, route_len, "budget", constraints),
         matrix,
         constraints,
     ) or min(
@@ -563,6 +620,8 @@ def _fill_single_day_density(
 
     def preference_rank(poi: dict) -> int:
         category = poi.get("category")
+        if any(PREFERENCE_CATEGORY_BONUS.get(pref, {}).get(category, 0) >= 0.14 for pref in prefs):
+            return 0
         if "夜景" in prefs and category in {"夜景", "娱乐"}:
             return 0
         if "游戏" in prefs and category == "娱乐":
@@ -661,6 +720,12 @@ def _repair_route_composition(route: list[dict], candidates: list[dict], constra
     while sum(1 for p in route if p.get("category") in food_categories) > max_food:
         replacement = best_from(activity_categories, prefer_cost=style == "premium")
         if not replacement:
+            if len(route) > max(3, max_food):
+                food_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") in food_categories]
+                idx, old = min(food_items, key=lambda item: item[1].get("_score", 0))
+                selected_ids.discard(old["id"])
+                route.pop(idx)
+                continue
             break
         food_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") in food_categories and poi.get("category") != "餐厅"]
         if not food_items:
@@ -674,6 +739,12 @@ def _repair_route_composition(route: list[dict], candidates: list[dict], constra
     while sum(1 for p in route if p.get("category") == "餐厅") > max_restaurants:
         replacement = best_from(activity_categories, prefer_cost=style == "premium")
         if not replacement:
+            if len(route) > max(3, max_restaurants + 2):
+                restaurant_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") == "餐厅"]
+                idx, old = min(restaurant_items, key=lambda item: item[1].get("_score", 0))
+                selected_ids.discard(old["id"])
+                route.pop(idx)
+                continue
             break
         restaurant_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") == "餐厅"]
         idx, old = min(restaurant_items, key=lambda item: item[1].get("_score", 0))
@@ -749,7 +820,7 @@ def _make_multiday_route_distinct(
     return route
 
 
-def _direct_style_route(candidates: list[dict], target_len: int, style: str) -> list[dict]:
+def _direct_style_route(candidates: list[dict], target_len: int, style: str, constraints: dict | None = None) -> list[dict]:
     if not candidates or target_len <= 0:
         return []
 
@@ -770,11 +841,22 @@ def _direct_style_route(candidates: list[dict], target_len: int, style: str) -> 
             selected.append(poi)
             seen.add(poi["id"])
 
-    if style == "food_fun":
-        for category, count in [("餐厅", 2), ("甜品", 1), ("咖啡", 1), ("购物", 1), ("娱乐", 1), ("夜景", 1), ("景点", 1), ("展览", 1)]:
+    prefs = set((constraints or {}).get("preferences") or [])
+    recipe = next((PREFERENCE_STYLE_RECIPES[pref] for pref in PREFERENCE_STYLE_RECIPES if pref in prefs), None)
+
+    if recipe and style in {"food_fun", "premium", "budget"}:
+        for category, count in recipe:
+            adjusted_count = count
+            if category == "餐厅" and target_len < 7:
+                adjusted_count = 1
+            add_from(category, adjusted_count, reverse_cost=style in {"food_fun", "premium"} and category in {"餐厅", "购物", "娱乐", "夜景"})
+    elif style == "food_fun":
+        meal_count = 2 if target_len >= 7 else 1
+        for category, count in [("餐厅", meal_count), ("甜品", 1), ("咖啡", 1), ("购物", 1), ("娱乐", 1), ("夜景", 1), ("景点", 1), ("展览", 1)]:
             add_from(category, count, reverse_cost=category in {"餐厅", "购物", "娱乐"})
     elif style == "premium":
-        for category, count in [("景点", 1), ("展览", 1), ("餐厅", 2), ("购物", 1), ("娱乐", 1), ("夜景", 1), ("咖啡", 1), ("甜品", 1), ("公园", 1)]:
+        meal_count = 2 if target_len >= 7 else 1
+        for category, count in [("景点", 1), ("展览", 1), ("餐厅", meal_count), ("购物", 1), ("娱乐", 1), ("夜景", 1), ("咖啡", 1), ("甜品", 1), ("公园", 1)]:
             add_from(category, count, reverse_cost=category in {"餐厅", "购物", "娱乐", "夜景"})
     elif style == "budget":
         for category in ["公园", "展览", "景点", "咖啡", "甜品", "餐厅", "购物", "娱乐", "夜景"]:
