@@ -39,9 +39,6 @@ docs
 # apikey
 config
 
-# test 
-backend/tests
-
 # claude
 .claude
 

@@ -40,6 +40,13 @@ export interface Connection {
   distance_m?: number;
   duration_minutes?: number;
   route_path?: Array<{ lng: number | string; lat: number | string }>;
+  transit_detail?: {
+    summary?: string;
+    duration?: string;
+    walking_distance?: string;
+    cost?: string;
+    segments?: string[];
+  };
 }
 
 export interface ItineraryDay {
@@ -62,6 +69,17 @@ export interface EventSuggestion {
   source?: string;
 }
 
+export interface UpgradeSuggestion {
+  title: string;
+  summary?: string;
+  summary_en?: string;
+  estimated_cost?: number;
+  category?: string;
+  tags?: string[];
+  reason?: string;
+  source?: string;
+}
+
 export interface Itinerary {
   blocks: ItineraryBlock[];
   connections: Connection[];
@@ -81,6 +99,7 @@ export interface Itinerary {
     note?: string;
   };
   event_suggestions?: EventSuggestion[];
+  upgrade_suggestions?: UpgradeSuggestion[];
   map_pois?: ItineraryBlock[];
   start_transfer?: Connection;
   guide_signals?: {
@@ -119,6 +138,9 @@ const CANVAS_TEXT = {
     nearby: "周边 POI",
     minute: "分钟",
     rating: "评分",
+    suggestions: "建议",
+    suggestionHint: "愿意追加部分预算时可考虑",
+    estimated: "预计",
     actions: {
       less_walking: "少走路",
       lower_budget: "性价比",
@@ -151,6 +173,9 @@ const CANVAS_TEXT = {
     nearby: "Nearby POI",
     minute: "min",
     rating: "Rating",
+    suggestions: "Suggestions",
+    suggestionHint: "Optional upgrades if you can stretch the budget",
+    estimated: "est.",
     actions: {
       less_walking: "Less walking",
       lower_budget: "Better value",
@@ -359,7 +384,8 @@ export default function Canvas({ itinerary, onClose, onItineraryUpdate, onAdjust
     try {
       const data = await apiPost<{ message: string; reply: string; itinerary?: Itinerary; alternatives?: Itinerary[] }>(
         "/api/itinerary/adjust",
-        { action, session_id: sessionId, payload: {} }
+        { action, session_id: sessionId, payload: {} },
+        { timeoutMs: 120000 }
       );
       if (data.itinerary) {
         data.itinerary.alternatives = data.alternatives || data.itinerary.alternatives || [];
@@ -455,7 +481,7 @@ export default function Canvas({ itinerary, onClose, onItineraryUpdate, onAdjust
             language={language}
             totalDays={days.length}
           />
-          {activePlan.start_transfer && activeDay === 1 && !currentDay.blocks.some((block) => block.is_start) && (
+          {activePlan.start_transfer && activeDay === 1 && (
             <StartTransfer transfer={activePlan.start_transfer} language={language} />
           )}
           <Timeline day={currentDay} selectedId={selectedId} onSelect={setSelectedId} language={language} />
@@ -514,6 +540,46 @@ function StartTransfer({ transfer, language }: { transfer: Connection; language:
   );
 }
 
+function UpgradeSuggestions({ suggestions, language }: { suggestions: UpgradeSuggestion[]; language: Language }) {
+  const text = CANVAS_TEXT[language];
+  if (!suggestions.length) return null;
+  return (
+    <section className="mb-4 rounded-lg border border-amber-200 bg-amber-50/70 p-4 shadow-sm">
+      <div className="mb-3 flex items-end justify-between gap-3">
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-700">{text.suggestions}</div>
+          <div className="mt-1 text-sm text-amber-900">{text.suggestionHint}</div>
+        </div>
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        {suggestions.slice(0, 4).map((item, index) => {
+          const summary = language === "en" ? (item.summary_en || item.summary) : item.summary;
+          return (
+            <article key={`${item.title}-${index}`} className="rounded-lg border border-amber-100 bg-white/90 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h4 className="truncate text-sm font-semibold text-slate-950">{item.title}</h4>
+                  <p className="mt-1 line-clamp-2 text-xs leading-5 text-slate-600">{summary}</p>
+                </div>
+                {item.estimated_cost ? (
+                  <span className="shrink-0 rounded-full bg-amber-100 px-2 py-1 text-[11px] font-semibold text-amber-800">
+                    {text.estimated} ¥{item.estimated_cost}
+                  </span>
+                ) : null}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1">
+                {([item.category, ...(item.tags || [])].filter(Boolean) as string[]).slice(0, 4).map((tag) => (
+                  <span key={tag} className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-600">{tag}</span>
+                ))}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function RouteMap({
   day,
   mapPois,
@@ -535,19 +601,29 @@ function RouteMap({
   const [zoomDelta, setZoomDelta] = useState(0);
   const [panPx, setPanPx] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
-  const nearbyPois = useMemo(() => filterNearbyPois(day.blocks, mapPois), [day.blocks, mapPois]);
-  const projected = useMemo(() => projectMapItems(day.blocks, nearbyPois, zoomDelta), [day.blocks, nearbyPois, zoomDelta]);
+  const routeBlocks = useMemo(() => day.blocks.filter((block) => !block.is_start), [day.blocks]);
+  const routeBlockIds = useMemo(() => new Set(routeBlocks.map((block) => block.id)), [routeBlocks]);
+  const routeConnections = useMemo(
+    () => day.connections.filter((conn) => routeBlockIds.has(conn.from) && routeBlockIds.has(conn.to)),
+    [day.connections, routeBlockIds],
+  );
+  const nearbyPois = useMemo(() => filterNearbyPois(routeBlocks, mapPois), [routeBlocks, mapPois]);
+  const projected = useMemo(() => projectMapItems(routeBlocks, nearbyPois, zoomDelta), [routeBlocks, nearbyPois, zoomDelta]);
   const routeSegments = projected.route.slice(0, -1).map((point, index) => ({
     from: point,
     to: projected.route[index + 1],
-    connection: day.connections[index],
-    path: projectConnectionPath(day.connections[index]?.route_path, projected.center, projected.zoom),
+    connection: routeConnections[index],
   }));
+  const routeMarkerLabel = (index: number) => {
+    const block = projected.route[index]?.block;
+    if (!block) return String(index + 1);
+    return String(index + 1);
+  };
 
   useEffect(() => {
     setPanPx({ x: 0, y: 0 });
     setZoomDelta(0);
-  }, [day.day_index, day.blocks]);
+  }, [day.day_index, routeBlocks]);
 
   useEffect(() => {
     const handleMouseMove = (event: MouseEvent) => {
@@ -607,49 +683,24 @@ function RouteMap({
           <svg className="absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden>
             {routeSegments.map((segment, index) => (
               <g key={`${segment.from.block.id}-${segment.to.block.id}`}>
-                {segment.path ? (
-                  <>
-                    <polyline
-                      points={segment.path}
-                      fill="none"
-                      stroke="rgba(255,255,255,0.92)"
-                      strokeWidth="0.78"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                    <polyline
-                      points={segment.path}
-                      fill="none"
-                      stroke={segment.connection?.mode === "公共交通" ? "#2563eb" : "#0ea5e9"}
-                      strokeWidth="0.28"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeDasharray={segment.connection?.mode === "公共交通" ? "1.2 0.8" : undefined}
-                    />
-                  </>
-                ) : (
-                  <>
-                    <line
-                      x1={segment.from.x}
-                      y1={segment.from.y}
-                      x2={segment.to.x}
-                      y2={segment.to.y}
-                      stroke="rgba(255,255,255,0.92)"
-                      strokeWidth="0.82"
-                      strokeLinecap="round"
-                    />
-                    <line
-                      x1={segment.from.x}
-                      y1={segment.from.y}
-                      x2={segment.to.x}
-                      y2={segment.to.y}
-                      stroke={segment.connection?.mode === "公共交通" ? "#2563eb" : "#0ea5e9"}
-                      strokeWidth="0.30"
-                      strokeLinecap="round"
-                      strokeDasharray={segment.connection?.mode === "公共交通" ? "1.2 0.8" : undefined}
-                    />
-                  </>
-                )}
+                <line
+                  x1={segment.from.x}
+                  y1={segment.from.y}
+                  x2={segment.to.x}
+                  y2={segment.to.y}
+                  stroke="rgba(255,255,255,0.95)"
+                  strokeWidth="0.88"
+                  strokeLinecap="round"
+                />
+                <line
+                  x1={segment.from.x}
+                  y1={segment.from.y}
+                  x2={segment.to.x}
+                  y2={segment.to.y}
+                  stroke={segment.connection?.mode === "公共交通" || segment.connection?.mode === "public transit" ? "#2563eb" : "#0ea5e9"}
+                  strokeWidth="0.32"
+                  strokeLinecap="round"
+                />
               </g>
             ))}
           </svg>
@@ -709,6 +760,7 @@ function RouteMap({
 
         {projected.route.map((point, index) => {
           const active = selectedId === point.block.id;
+          const markerColor = routeMarkerColor(index, Boolean(point.block.is_start));
           return (
             <button
               key={point.block.id}
@@ -717,13 +769,13 @@ function RouteMap({
                 onSelect(active ? null : point.block.id);
               }}
               onMouseDown={(event) => event.stopPropagation()}
-              className={`absolute z-20 flex h-8 w-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 text-xs font-bold shadow-lg transition hover:scale-110 ${
-                active ? "border-white bg-blue-700 text-white ring-4 ring-blue-100" : "border-white bg-blue-600 text-white ring-4 ring-white/75"
+              className={`absolute z-20 flex h-8 w-8 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border-2 text-xs font-bold text-white shadow-[0_10px_24px_rgba(15,23,42,0.22)] transition hover:scale-110 ${
+                active ? "border-white ring-4 ring-blue-100" : "border-white ring-4 ring-white/80"
               }`}
-              style={{ left: `${point.x}%`, top: `${point.y}%` }}
+              style={{ left: `${point.x}%`, top: `${point.y}%`, backgroundColor: markerColor }}
               title={point.block.name}
             >
-              {index + 1}
+              {routeMarkerLabel(index)}
             </button>
           );
         })}
@@ -816,6 +868,7 @@ function Timeline({
   language: Language;
 }) {
   const text = CANVAS_TEXT[language];
+  const [openConnection, setOpenConnection] = useState<string | null>(null);
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
       <div className="mb-4 flex items-center justify-between">
@@ -866,8 +919,34 @@ function Timeline({
                 </div>
               </button>
               {connection && (
-                <div className="ml-[114px] mt-2 inline-flex rounded-full bg-white px-3 py-1.5 text-xs text-slate-500 shadow-sm ring-1 ring-slate-200">
-                  {displayMode(connection.mode, language)} · {connection.distance} · {connection.time}
+                <div className="ml-[114px] mt-2">
+                  <button
+                    type="button"
+                    onClick={() => setOpenConnection(openConnection === `${connection.from}-${connection.to}` ? null : `${connection.from}-${connection.to}`)}
+                    className="inline-flex rounded-full bg-white px-3 py-1.5 text-xs text-slate-500 shadow-sm ring-1 ring-slate-200 transition hover:bg-blue-50 hover:text-blue-700 hover:ring-blue-200"
+                  >
+                    {displayMode(connection.mode, language)} · {connection.distance} · {connection.time}
+                  </button>
+                  {openConnection === `${connection.from}-${connection.to}` && (
+                    <div className="mt-2 max-w-xl rounded-lg border border-slate-200 bg-white p-3 text-xs leading-5 text-slate-600 shadow-sm">
+                      <div className="font-semibold text-slate-900">
+                        {connection.transit_detail?.summary || (language === "en" ? "Transfer estimate" : "转场估算")}
+                      </div>
+                      {connection.transit_detail?.segments?.length ? (
+                        <ul className="mt-2 space-y-1">
+                          {connection.transit_detail.segments.slice(0, 5).map((segment, idx) => (
+                            <li key={`${segment}-${idx}`}>{segment}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-1">
+                          {language === "en"
+                            ? "Detailed transit is not available yet. The current route uses distance and duration estimates."
+                            : "暂未获取到公交换乘明细，当前展示为距离和时间估算。"}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -884,15 +963,32 @@ const TILE_SIZE = 256;
 
 function AbstractRouteBackdrop() {
   return (
-    <div className="absolute inset-0 overflow-hidden bg-[radial-gradient(circle_at_18%_22%,rgba(14,165,233,0.18),transparent_30%),radial-gradient(circle_at_82%_72%,rgba(16,185,129,0.18),transparent_28%),linear-gradient(135deg,#eef7fb_0%,#f8fafc_58%,#eef2ff_100%)]">
-      <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(148,163,184,0.18)_1px,transparent_1px),linear-gradient(to_bottom,rgba(148,163,184,0.18)_1px,transparent_1px)] bg-[size:56px_56px]" />
-      <svg className="absolute inset-0 h-full w-full opacity-70" viewBox="0 0 1200 420" preserveAspectRatio="none" aria-hidden>
-        <path d="M-80 290 C160 238 250 322 410 260 S720 150 900 210 S1100 330 1280 250" fill="none" stroke="rgba(148,163,184,0.35)" strokeWidth="12" strokeLinecap="round" />
-        <path d="M80 40 C240 115 300 80 450 120 S640 240 800 190 S980 80 1180 118" fill="none" stroke="rgba(125,211,252,0.34)" strokeWidth="18" strokeLinecap="round" />
-        <path d="M180 410 C270 310 330 270 470 300 S760 360 920 292 S1040 170 1240 180" fill="none" stroke="rgba(203,213,225,0.42)" strokeWidth="8" strokeLinecap="round" strokeDasharray="18 18" />
+    <div className="absolute inset-0 overflow-hidden bg-[#eef7fb]">
+      <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(37,99,235,0.06)_1px,transparent_1px),linear-gradient(to_bottom,rgba(37,99,235,0.06)_1px,transparent_1px)] bg-[size:44px_44px]" />
+      <svg className="absolute inset-0 h-full w-full" viewBox="0 0 1200 420" preserveAspectRatio="none" aria-hidden>
+        <rect x="0" y="296" width="1200" height="124" fill="rgba(125,211,252,0.28)" />
+        <rect x="70" y="70" width="210" height="112" rx="18" fill="rgba(255,255,255,0.60)" stroke="rgba(226,232,240,0.9)" />
+        <rect x="432" y="46" width="276" height="116" rx="22" fill="rgba(255,255,255,0.56)" stroke="rgba(226,232,240,0.9)" />
+        <rect x="930" y="238" width="198" height="126" rx="24" fill="rgba(187,247,208,0.38)" stroke="rgba(134,239,172,0.55)" />
+        <rect x="94" y="238" width="146" height="132" rx="28" fill="rgba(187,247,208,0.30)" stroke="rgba(134,239,172,0.42)" />
+        <line x1="42" y1="248" x2="1162" y2="248" stroke="rgba(255,255,255,0.92)" strokeWidth="11" strokeLinecap="round" />
+        <line x1="122" y1="338" x2="1104" y2="338" stroke="rgba(255,255,255,0.82)" strokeWidth="8" strokeLinecap="round" />
+        <line x1="224" y1="0" x2="314" y2="420" stroke="rgba(255,255,255,0.74)" strokeWidth="8" strokeLinecap="round" />
+        <line x1="706" y1="0" x2="662" y2="420" stroke="rgba(255,255,255,0.78)" strokeWidth="9" strokeLinecap="round" />
+        <line x1="0" y1="128" x2="1200" y2="186" stroke="rgba(255,255,255,0.78)" strokeWidth="9" strokeLinecap="round" />
+        <line x1="72" y1="84" x2="1092" y2="274" stroke="rgba(148,163,184,0.24)" strokeWidth="3" strokeDasharray="12 14" strokeLinecap="round" />
+        {Array.from({ length: 9 }).map((_, index) => (
+          <line
+            key={index}
+            x1={index * 140}
+            y1="0"
+            x2={index * 140 - 54}
+            y2="420"
+            stroke="rgba(37,99,235,0.08)"
+            strokeWidth="1"
+          />
+        ))}
       </svg>
-      <div className="absolute left-[8%] top-[14%] h-20 w-52 rotate-3 rounded-full border border-white/70 bg-white/35" />
-      <div className="absolute bottom-[10%] right-[9%] h-28 w-64 -rotate-6 rounded-full border border-white/70 bg-white/30" />
     </div>
   );
 }
@@ -926,7 +1022,7 @@ function projectMapItems(routeBlocks: ItineraryBlock[], mapPois: ItineraryBlock[
     return {
       center: null,
       zoom: 13,
-      route: routeBlocks.map((block, index) => ({ block, x: 14 + (index % 4) * 24, y: 22 + Math.floor(index / 4) * 28 })),
+      route: spreadProjectedPoints(routeBlocks.map((block, index) => ({ block, x: 14 + (index % 4) * 24, y: 22 + Math.floor(index / 4) * 28 })), 6.2),
       pois: [],
     };
   }
@@ -953,32 +1049,33 @@ function projectMapItems(routeBlocks: ItineraryBlock[], mapPois: ItineraryBlock[
   return {
     center,
     zoom,
-    route: routeCoords.map(project),
-    pois: poiCoords.map(project),
+    route: spreadProjectedPoints(routeCoords.map(project), 6.2),
+    pois: spreadProjectedPoints(poiCoords.map(project), 4.6),
   };
 }
 
-function projectConnectionPath(
-  path: Connection["route_path"] | undefined,
-  center: { lng: number; lat: number } | null,
-  zoom: number
-) {
-  if (!path || path.length < 2 || !center) return null;
-  const centerWorld = lngLatToWorld(center.lng, center.lat, zoom);
-  const points = path
-    .map((item) => {
-      const lng = toNumber(item.lng);
-      const lat = toNumber(item.lat);
-      if (lng === null || lat === null) return null;
-      const world = lngLatToWorld(lng, lat, zoom);
-      return {
-        x: clamp(((world.x - centerWorld.x + MAP_W / 2) / MAP_W) * 100, -20, 120),
-        y: clamp(((world.y - centerWorld.y + MAP_H / 2) / MAP_H) * 100, -20, 120),
-      };
-    })
-    .filter((item): item is { x: number; y: number } => Boolean(item));
-  if (points.length < 2) return null;
-  return points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
+function spreadProjectedPoints<T extends { block: ItineraryBlock; x: number; y: number }>(points: T[], minDistance: number): T[] {
+  const adjusted: T[] = [];
+  for (const point of points) {
+    let x = point.x;
+    let y = point.y;
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      const conflict = adjusted.find((item) => Math.hypot(item.x - x, item.y - y) < minDistance);
+      if (!conflict) break;
+      const angle = (adjusted.length + attempt * 2.15) * 1.618;
+      const push = minDistance + attempt * 1.2;
+      x = clamp(point.x + Math.cos(angle) * push, 4, 96);
+      y = clamp(point.y + Math.sin(angle) * push, 7, 93);
+    }
+    adjusted.push({ ...point, x, y });
+  }
+  return adjusted;
+}
+
+function routeMarkerColor(index: number, isStart: boolean) {
+  if (isStart) return "#0284c7";
+  const colors = ["#2563eb", "#0891b2", "#7c3aed", "#ea580c", "#db2777", "#16a34a", "#0f766e", "#4f46e5"];
+  return colors[index % colors.length];
 }
 
 function toCoordItems(blocks: ItineraryBlock[]) {

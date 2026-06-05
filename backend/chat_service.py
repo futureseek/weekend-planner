@@ -25,6 +25,7 @@ DEFAULT_STATE = {
     "area_info": None,
     "alternative_plans": [],
     "event_suggestions": [],
+    "upgrade_suggestions": [],
     "guide_signals": {},
     "modify_action": None,
     "modify_payload": None,

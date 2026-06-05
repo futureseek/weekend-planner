@@ -9,7 +9,7 @@ from . import nodes
 def _build_llm(model_config: dict):
     llm_kwargs = {}
     extra_body = model_config.get("extra_body") or {}
-    if extra_body and extra_body.get("thinking", {}).get("type") != "disabled":
+    if extra_body:
         llm_kwargs["extra_body"] = extra_body
     if "openai.com" in str(model_config.get("base_url") or "") and model_config.get("reasoning_effort"):
         llm_kwargs["reasoning_effort"] = model_config.get("reasoning_effort")

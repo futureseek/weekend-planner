@@ -25,7 +25,7 @@ def load_config(config_path: str = None) -> dict:
     if config_path is None:
         config_path = os.path.join(os.path.dirname(__file__), "..", "config", "api_config.json")
 
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, "r", encoding="utf-8-sig") as f:
         raw = json.load(f)
 
     model_root = raw.get("model", {}) or {}

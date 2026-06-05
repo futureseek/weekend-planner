@@ -35,6 +35,7 @@ class PlannerState(TypedDict):
     area_info: dict | None
     alternative_plans: list[dict]
     event_suggestions: list[dict]
+    upgrade_suggestions: list[dict]
     guide_signals: dict
 
     # 修改动作
