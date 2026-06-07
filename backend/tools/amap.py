@@ -31,9 +31,9 @@ def fetch_transit_plan(origin: str, destination: str, city: str = "", cityd: str
             "cityd": cityd or city,
             "strategy": 0,
             "nightflag": 1,
-            "extensions": "base",
+            "extensions": "all",
         },
-        timeout=5,
+        timeout=3,
     )
     if data.get("status") != "1":
         return None
@@ -46,6 +46,20 @@ def fetch_transit_plan(origin: str, destination: str, city: str = "", cityd: str
     walking_distance = int(float(transit.get("walking_distance") or 0)) if transit.get("walking_distance") else 0
     cost = transit.get("cost")
     segments = []
+    route_path: list[dict] = []
+
+    def add_polyline(polyline: str | None) -> None:
+        for token in str(polyline or "").split(";"):
+            if "," not in token:
+                continue
+            lng, lat = token.split(",", 1)
+            try:
+                point = {"lng": round(float(lng), 6), "lat": round(float(lat), 6)}
+            except ValueError:
+                continue
+            if not route_path or route_path[-1] != point:
+                route_path.append(point)
+
     for segment in transit.get("segments") or []:
         bus = segment.get("bus") or {}
         lines = bus.get("buslines") or []
@@ -58,9 +72,12 @@ def fetch_transit_plan(origin: str, destination: str, city: str = "", cityd: str
                 segments.append(f"{line_name}: {departure} → {arrival}".strip())
             else:
                 segments.append(line_name)
+            add_polyline(line.get("polyline"))
             continue
         walking = segment.get("walking") or {}
         walk_distance = walking.get("distance")
+        for step in walking.get("steps") or []:
+            add_polyline(step.get("polyline"))
         if walk_distance:
             try:
                 meters = int(float(walk_distance))
@@ -74,6 +91,7 @@ def fetch_transit_plan(origin: str, destination: str, city: str = "", cityd: str
         "walking_distance": f"{walking_distance}m" if walking_distance else "",
         "cost": f"¥{cost}" if cost not in (None, "") else "",
         "segments": segments[:6],
+        "route_path": route_path[:260],
         "source": "amap_transit",
     }
 
@@ -99,6 +117,89 @@ def _extract_poi(poi: dict) -> dict:
         "cityname": _normalize_text(poi.get("cityname")),
         "adname": _normalize_text(poi.get("adname")),
     }
+
+
+def _safe_int(value, default: int = 999999) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _anchor_from_regeo(location: str, radius: int) -> dict | None:
+    """Fallback to rich reverse-geocode details when no POI exists within 20m."""
+    data = _amap_get(
+        "/geocode/regeo",
+        {
+            "location": location,
+            "extensions": "all",
+            "radius": max(20, min(int(radius or 20), 80)),
+            "roadlevel": 0,
+        },
+        timeout=4,
+    )
+    if data.get("status") != "1":
+        return None
+
+    regeocode = data.get("regeocode", {}) or {}
+    address = regeocode.get("addressComponent", {}) or {}
+    base = {
+        "pname": _normalize_text(address.get("province")),
+        "cityname": _normalize_text(address.get("city")) or _normalize_text(address.get("province")),
+        "adname": _normalize_text(address.get("district")),
+        "adcode": address.get("adcode", ""),
+    }
+    max_radius = max(20, int(radius or 20))
+
+    candidates = []
+    for poi in regeocode.get("pois", []) or []:
+        name = _normalize_text(poi.get("name"))
+        if not name:
+            continue
+        distance = _safe_int(poi.get("distance"))
+        if distance <= max_radius:
+            item = _extract_poi(poi)
+            item.update(base)
+            item["distance_m"] = distance
+            item["source"] = "regeo_poi_20m"
+            candidates.append(item)
+
+    for road in regeocode.get("roads", []) or []:
+        name = _normalize_text(road.get("name"))
+        if not name:
+            continue
+        distance = _safe_int(road.get("distance"))
+        if distance <= max_radius:
+            candidates.append({
+                **base,
+                "name": f"{name}附近",
+                "address": regeocode.get("formatted_address", ""),
+                "location": road.get("location") if isinstance(road.get("location"), str) else location,
+                "type": "road",
+                "distance_m": distance,
+                "source": "regeo_road_20m",
+            })
+
+    for aoi in regeocode.get("aois", []) or []:
+        name = _normalize_text(aoi.get("name"))
+        if not name:
+            continue
+        distance = _safe_int(aoi.get("distance"))
+        if distance <= max_radius:
+            candidates.append({
+                **base,
+                "name": name,
+                "address": regeocode.get("formatted_address", ""),
+                "location": aoi.get("location") if isinstance(aoi.get("location"), str) else location,
+                "type": "aoi",
+                "distance_m": distance,
+                "source": "regeo_aoi_20m",
+            })
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item.get("distance_m", 999999), len(_normalize_text(item.get("name")))))
+    return candidates[0]
 
 
 def fetch_nearest_anchor(location: str, radius: int = 20) -> dict | None:
@@ -134,8 +235,9 @@ def fetch_nearest_anchor(location: str, radius: int = 20) -> dict | None:
             item["distance_m"] = distance
             candidates.append(item)
     if not candidates:
-        return None
+        return _anchor_from_regeo(location, radius)
     candidates.sort(key=lambda item: (item.get("distance_m", 999999), len(_normalize_text(item.get("name")))))
+    candidates[0]["source"] = "nearest_poi_20m"
     return candidates[0]
 
 
@@ -286,7 +388,7 @@ def search_poi(keyword: str, city: str, types: str = "") -> str:
     if types:
         params["types"] = types
 
-    data = _amap_get("/place/text", params, timeout=4)
+    data = _amap_get("/place/text", params, timeout=3)
 
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "请求失败")}, ensure_ascii=False)
@@ -316,7 +418,7 @@ def search_nearby(location: str, keyword: str, radius: int = 2000) -> str:
         "page": 1,
     }
 
-    data = _amap_get("/place/around", params, timeout=8)
+    data = _amap_get("/place/around", params, timeout=4)
 
     if data.get("status") != "1":
         return json.dumps({"error": data.get("info", "请求失败")}, ensure_ascii=False)
@@ -352,7 +454,7 @@ def batch_search_poi(keywords: list[str], city: str) -> str:
             "citylimit": "true" if city else "false",
         }
         try:
-            data = _amap_get("/place/text", params, timeout=5)
+            data = _amap_get("/place/text", params, timeout=3)
             if data.get("status") == "1":
                 for poi in data.get("pois", [])[:5]:
                     item = _extract_poi(poi)
@@ -443,7 +545,7 @@ def fetch_direction_polyline(origin: str, destination: str, mode: str = "walking
         return []
 
     try:
-        data = _amap_get(endpoint, {"origin": origin, "destination": destination}, timeout=5)
+        data = _amap_get(endpoint, {"origin": origin, "destination": destination}, timeout=3)
     except Exception:
         return []
     if data.get("status") != "1":

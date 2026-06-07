@@ -25,10 +25,23 @@ def build_city_guide(city: str, preferences: list[str] | None = None, limit: int
         return {}
 
     prefs = " ".join(preferences or [])
-    query = f"{city} {prefs} 小红书 攻略 避雷 推荐 排队 时间安排"
+    queries = _build_guide_queries(city, preferences or [])
+    if prefs:
+        queries.insert(0, f"{city} {prefs} 小红书 攻略 避雷 推荐 排队 时间安排")
+
+    items = []
+    seen = set()
     try:
-        raw = search_xhs_public_notes.invoke({"query": query, "limit": limit})
-        items = json.loads(raw) if isinstance(raw, str) else raw
+        for query in queries[:2]:
+            raw = search_xhs_public_notes.invoke({"query": query, "limit": max(3, limit // 2)})
+            batch = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(batch, list):
+                continue
+            for item in batch:
+                key = item.get("url") or item.get("title")
+                if key and key not in seen:
+                    seen.add(key)
+                    items.append(item)
     except Exception:
         return {}
 
@@ -45,11 +58,48 @@ def build_city_guide(city: str, preferences: list[str] | None = None, limit: int
     return {
         "source": "xhs_public_search",
         "snippets": snippets[:4],
+        "hot_places": _extract_hot_places(combined)[:12],
         "time_hints": _collect_time_hints(combined),
         "avoid_keywords": _collect_keywords(combined, AVOID_HINTS),
         "positive_keywords": _collect_keywords(combined, POSITIVE_HINTS),
         "strategy": _build_strategy(combined),
     }
+
+
+def _build_guide_queries(city: str, preferences: list[str]) -> list[str]:
+    pref_text = " ".join(preferences)
+    queries = [
+        f"{city} 小红书 本地人推荐 宝藏小店 路线 收藏",
+        f"{city} 小红书 避雷 排队 少排队 探店",
+        f"{city} 小红书 周末 攻略 小众 好玩 好吃",
+    ]
+    if any(pref in preferences for pref in ["美食", "咖啡", "探店", "休闲"]):
+        queries.append(f"{city} {pref_text} 小红书 好吃 人均 控排队 宝藏餐厅")
+    if any(pref in preferences for pref in ["游戏", "娱乐", "夜景", "热闹"]):
+        queries.append(f"{city} {pref_text} 小红书 晚上 好玩 livehouse 电竞 夜景")
+    if any(pref in preferences for pref in ["看展", "拍照", "历史"]):
+        queries.append(f"{city} {pref_text} 小红书 展览 拍照 打卡 小众")
+    if any(pref in preferences for pref in ["爬山", "户外", "自然"]):
+        queries.append(f"{city} {pref_text} 小红书 徒步 爬山 公园 路线")
+    return queries
+
+
+def _extract_hot_places(text: str) -> list[str]:
+    candidates = []
+    patterns = [
+        r"[「【《]([^」】》]{2,24})[」】》]",
+        r"([\u4e00-\u9fa5A-Za-z0-9·&' -]{2,24})(?:店|馆|园|城|街|塔|山|湖|寺|吧|剧场|Livehouse|livehouse)",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, text):
+            name = re.sub(r"\s+", " ", match).strip(" -:：，,。")
+            if len(name) < 2:
+                continue
+            if any(bad in name for bad in ["攻略", "推荐", "避雷", "排队", "时间", "路线", "小红书"]):
+                continue
+            if name not in candidates:
+                candidates.append(name)
+    return candidates
 
 
 def _collect_time_hints(text: str) -> dict:

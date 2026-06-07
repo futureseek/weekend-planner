@@ -8,7 +8,7 @@ Roam 是一个本地智能路线规划系统。用户选择城市、区县、日
 
 - 结构化条件输入：城市、区县、起点、日期范围、时间范围、预算、人数独立填写，偏好保留自然语言。
 - 全国 POI 检索：优先调用高德 Web 服务，SQLite 种子数据兜底。
-- 起点定位：浏览器定位后，后端会查找 20m 内最近 POI 作为公共交通起点锚点。
+- 起点定位：前端可优先使用高德 JS API 高精度定位；后端只接受精度足够的坐标，并查找 20m 内最近 POI/道路/AOI 作为公共交通起点锚点。
 - 起点搜索：支持文字搜索起点，合并高德输入提示、POI 搜索和地理编码结果。
 - 多方案路线：综合推荐、少走路、吃好玩好、省钱轻量等方案可切换。
 - 多日拆分：按日期范围生成 Day 1 / Day 2 / Day N。
@@ -124,7 +124,11 @@ weekend-planner/
 
 ```bash
 NEXT_PUBLIC_API_BASE=http://127.0.0.1:5000
+NEXT_PUBLIC_AMAP_JS_KEY=高德地图 JavaScript API Key
+NEXT_PUBLIC_AMAP_SECURITY_JS_CODE=高德地图 JavaScript API 安全密钥
 ```
+
+`NEXT_PUBLIC_AMAP_JS_KEY` 不是必填；未配置时会退回浏览器原生定位。但桌面端原生定位可能退化成低精度坐标，Roam 会拒绝写入低精度起点，建议配置高德 JS API Key。
 
 ## 启动
 

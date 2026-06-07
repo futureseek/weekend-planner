@@ -2,6 +2,8 @@ import json
 import re
 from html.parser import HTMLParser
 from urllib.parse import urlparse
+from datetime import datetime
+from functools import lru_cache
 
 import requests
 from langchain_core.tools import tool
@@ -41,17 +43,35 @@ def search_xhs_public_notes(query: str, limit: int = 5) -> str:
     适合给路线规划补充“种草/避雷/排队/拍照点”等 UGC 信号。
     """
     limit = max(1, min(int(limit or 5), 10))
+    return _search_xhs_public_notes_cached(query.strip(), limit)
+
+
+@lru_cache(maxsize=64)
+def _search_xhs_public_notes_cached(query: str, limit: int) -> str:
+    year = datetime.now().year
     search_queries = [
-        f"site:xiaohongshu.com {query} 小红书 攻略 推荐 排队 避雷",
-        f"{query} 小红书 攻略 推荐 排队 避雷",
-        f"{query} 种草 避雷 探店 推荐",
+        f"site:xiaohongshu.com/explore {query} 小红书 {year} 攻略 收藏 推荐 避雷 排队",
+        f"site:xiaohongshu.com {query} 小红书 探店 宝藏 小众 本地人 推荐",
+        f"{query} 小红书 攻略 推荐 收藏 排队 避雷",
+        f"{query} 种草 避雷 探店 宝藏 小店 路线",
     ]
 
     items = []
-    for search_query in search_queries:
+    seen_urls: set[str] = set()
+    seen_titles: set[str] = set()
+    for search_query in search_queries[:2]:
         raw = search_reviews.invoke({"query": search_query})
-        items = _parse_search_items(raw)
-        if items:
+        for item in _parse_search_items(raw):
+            url = item.get("url", "")
+            title = re.sub(r"\s+", " ", item.get("title", "")).strip()
+            key = url or title
+            if not key or url in seen_urls or title in seen_titles:
+                continue
+            seen_urls.add(url)
+            seen_titles.add(title)
+            item["_query"] = search_query
+            items.append(item)
+        if len(items) >= limit * 2:
             break
 
     results = []
@@ -59,15 +79,25 @@ def search_xhs_public_notes(query: str, limit: int = 5) -> str:
         url = item.get("url", "")
         title = item.get("title", "")
         content = item.get("content", "")
+        text = f"{title} {content}"
+        score = 0
+        if _is_xhs_url(url):
+            score += 4
+        if "小红书" in title or "小红书" in content:
+            score += 2
+        if any(word in text for word in ["收藏", "人均", "排队", "避雷", "本地人", "宝藏", "小众", "探店", "路线", "近期"]):
+            score += 2
+        if str(year) in text or "今年" in text or "最近" in text:
+            score += 1
         if _is_xhs_url(url) or "小红书" in title or "小红书" in content:
             results.append({
                 "title": title,
                 "url": url,
                 "content": content[:300],
                 "source": "xhs_search",
+                "score": score,
             })
-        if len(results) >= limit:
-            break
+    results.sort(key=lambda item: item.get("score", 0), reverse=True)
 
     if not results and items:
         for item in items[:limit]:
@@ -76,9 +106,10 @@ def search_xhs_public_notes(query: str, limit: int = 5) -> str:
                 "url": item.get("url", ""),
                 "content": item.get("content", "")[:300],
                 "source": "public_search",
+                "score": 0,
             })
 
-    return json.dumps(results, ensure_ascii=False)
+    return json.dumps(results[:limit], ensure_ascii=False)
 
 
 class _VisibleTextParser(HTMLParser):

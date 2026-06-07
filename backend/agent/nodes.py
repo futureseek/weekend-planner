@@ -1394,17 +1394,21 @@ def collect_data_node(state: PlannerState, llm) -> dict:
         search_preferences = _merge_unique(search_preferences + ["娱乐", "探店"])
     if set(preferences) & {"美食", "休闲"}:
         search_preferences = _merge_unique(search_preferences + ["探店", "咖啡", "甜品", "娱乐"])
+    if set(preferences) & {"游戏", "娱乐"}:
+        search_preferences = _merge_unique(search_preferences + ["游戏", "娱乐", "夜景", "购物"])
     budget = constraints.get("budget")
     people_count = constraints.get("people_count") or 1
     max_cost = (budget / people_count) * 0.85 if budget else None
 
-    poi_limit = min(42, max(18, int(constraints.get("trip_days") or 1) * 8))
+    poi_limit = min(56, max(26, int(constraints.get("trip_days") or 1) * 12))
     selected_districts = list(dict.fromkeys(constraints.get("districts") or []))
     area_info = resolve_area(constraints)
     pois = []
     if selected_districts:
         constraints["area"] = "、".join(selected_districts)
-        per_area_limit = max(10, min(24, math_ceil(poi_limit / max(1, len(selected_districts))) + 4))
+        district_count = max(1, len(selected_districts))
+        per_area_limit = max(8, min(14, math_ceil(poi_limit / district_count) + 2))
+        keyword_limit = 6 if district_count >= 2 else 10
         area_infos = []
         known_districts = _city_district_names(city)
         for district in selected_districts:
@@ -1420,6 +1424,7 @@ def collect_data_node(state: PlannerState, llm) -> dict:
                 adcode=district_info.get("adcode"),
                 center=district_info.get("center"),
                 radius_m=_district_radius(district_info),
+                keyword_limit=keyword_limit,
             )
             pois.extend(_filter_pois_for_district(district_pois, district, district_info, known_districts))
         area_info = area_infos[0] if area_infos else area_info
@@ -1473,12 +1478,15 @@ def collect_data_node(state: PlannerState, llm) -> dict:
         _log("collect_data", f"形成 {len(upgrade_suggestions)} 条升级建议")
 
     guide_trigger_prefs = {"美食", "咖啡", "探店", "热闹", "娱乐", "游戏", "夜景", "购物", "看展"}
+    guide_keywords = ["小红书", "攻略", "避雷", "网红", "xhs", "xiaohongshu", "吃好", "好吃", "宝藏", "探店"]
+    explicit_guide_need = any(word in last_message.lower() for word in guide_keywords)
+    premium_guide_need = constraints.get("budget_level") in {"comfort", "premium"} and bool(set(preferences) & guide_trigger_prefs)
     should_build_guide = bool(
         not modify_action
         and (
             constraints.get("ugc_source") == "xhs"
-            or any(word in last_message.lower() for word in ["小红书", "攻略", "避雷", "网红", "xhs", "xiaohongshu", "吃好", "好吃"])
-            or bool(set(preferences) & guide_trigger_prefs)
+            or explicit_guide_need
+            or premium_guide_need
         )
     )
     guide_signals = build_city_guide(city, preferences) if should_build_guide else {}
@@ -1486,6 +1494,7 @@ def collect_data_node(state: PlannerState, llm) -> dict:
         constraints["guide_strategy"] = guide_signals.get("strategy", [])
         constraints["guide_positive_keywords"] = guide_signals.get("positive_keywords", [])
         constraints["guide_avoid_keywords"] = guide_signals.get("avoid_keywords", [])
+        constraints["guide_hot_places"] = guide_signals.get("hot_places", [])
         _log("collect_data", f"形成攻略信号 {len(guide_signals.get('snippets', []))} 条")
 
     return {
@@ -1567,6 +1576,115 @@ def _display_highlights(highlights: list[str], constraints: dict) -> list[str]:
     return [mapping.get(item, item) for item in highlights]
 
 
+def _display_preferences(preferences: list[str], constraints: dict) -> str:
+    if constraints.get("language") != "en":
+        return "、".join(preferences or ["综合体验"])
+    mapping = {
+        "综合体验": "balanced experience",
+        "美食": "food",
+        "吃好": "better dining",
+        "少排队": "fewer queues",
+        "休闲": "relaxed pace",
+        "放松": "relaxing stops",
+        "自然": "nature",
+        "夜景": "night views",
+        "购物": "shopping",
+        "探店": "hidden gems",
+        "咖啡": "coffee",
+        "甜品": "dessert",
+        "娱乐": "entertainment",
+        "游戏": "gaming",
+        "看展": "exhibitions",
+        "爬山": "hiking",
+        "亲子": "family friendly",
+    }
+    return ", ".join(mapping.get(item, item) for item in (preferences or ["综合体验"]))
+
+
+def build_itinerary_from_plan(
+    plan: dict,
+    matrix: dict,
+    constraints: dict,
+    people_count: int | None = None,
+    transport_mode: str | None = None,
+    event_suggestions: list[dict] | None = None,
+    upgrade_suggestions: list[dict] | None = None,
+    guide_signals: dict | None = None,
+    all_pois: list[dict] | None = None,
+    include_route_details: bool = False,
+    include_start_detail: bool = False,
+) -> dict:
+    people_count = max(1, int(people_count or constraints.get("people_count") or 1))
+    transport_mode = transport_mode or constraints.get("transport_mode", "walking")
+    event_suggestions = event_suggestions or []
+    upgrade_suggestions = upgrade_suggestions or []
+    guide_signals = guide_signals or {}
+    all_pois = all_pois or plan.get("route", [])
+
+    blocks = _build_blocks(plan["route"], people_count)
+    connections = _build_connections(plan["route"], matrix, transport_mode, constraints, include_details=include_route_details)
+    day_plan = _split_into_days(blocks, connections, constraints, guide_signals)
+    start_transfer = _build_start_transfer(
+        constraints,
+        day_plan["blocks"][0] if day_plan["blocks"] else None,
+        include_details=include_start_detail,
+    )
+    if start_transfer:
+        day_plan = _apply_start_transfer_to_day_plan(day_plan, int(start_transfer.get("duration_minutes") or 0), constraints)
+        first_after_trim = day_plan["blocks"][0] if day_plan["blocks"] else None
+        if first_after_trim and first_after_trim.get("id") != start_transfer.get("to"):
+            start_transfer = _build_start_transfer(constraints, first_after_trim, include_details=include_start_detail)
+        if start_transfer:
+            day_plan = _inject_start_block(day_plan, start_transfer, constraints)
+
+    actual_duration = sum(day.get("total_duration", 0) for day in day_plan["days"])
+    actual_price = sum(block.get("price", 0) for block in day_plan["blocks"])
+    return {
+        "blocks": day_plan["blocks"],
+        "connections": day_plan["connections"],
+        "days": day_plan["days"],
+        "total_duration": actual_duration or plan["score"].get("total_duration_s", 0) // 60,
+        "total_price": actual_price or plan["score"].get("total_cost", 0),
+        "score": plan["score"].get("route_score", 0),
+        "plan_name": _display_plan_name(plan["name"], constraints),
+        "style": plan.get("style", plan["name"]),
+        "highlights": _display_highlights(plan.get("highlights", []), constraints),
+        "total_distance": plan["score"].get("total_distance_m", 0) + int((start_transfer or {}).get("distance_m") or 0),
+        "time_plan": constraints.get("time_strategy", {}),
+        "event_suggestions": event_suggestions,
+        "upgrade_suggestions": upgrade_suggestions,
+        "guide_signals": guide_signals,
+        "map_pois": _build_map_pois(all_pois, plan["route"], people_count),
+        "start_transfer": start_transfer,
+    }
+
+
+def _budget_limit_value(constraints: dict | None) -> int | None:
+    try:
+        budget = int((constraints or {}).get("budget") or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    return budget if budget > 0 else None
+
+
+def _itinerary_price(itinerary: dict | None) -> int:
+    if not isinstance(itinerary, dict):
+        return 0
+    try:
+        total = int(itinerary.get("total_price") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total > 0:
+        return total
+    blocks = itinerary.get("blocks") or []
+    return sum(int(block.get("price") or 0) for block in blocks if isinstance(block, dict))
+
+
+def _itinerary_within_budget(itinerary: dict | None, constraints: dict | None) -> bool:
+    budget = _budget_limit_value(constraints)
+    return budget is None or _itinerary_price(itinerary) <= budget
+
+
 def optimize_route_node(state: PlannerState) -> dict:
     _log("optimize", "进入路线优化节点")
 
@@ -1611,41 +1729,35 @@ def optimize_route_node(state: PlannerState) -> dict:
     upgrade_suggestions = state.get("upgrade_suggestions", [])
     guide_signals = state.get("guide_signals", {})
 
-    def to_itinerary(plan: dict) -> dict:
-        blocks = _build_blocks(plan["route"], people_count)
-        connections = _build_connections(plan["route"], matrix, transport_mode, constraints)
-        day_plan = _split_into_days(blocks, connections, constraints, guide_signals)
-        start_transfer = _build_start_transfer(constraints, day_plan["blocks"][0] if day_plan["blocks"] else None)
-        if start_transfer:
-            day_plan = _apply_start_transfer_to_day_plan(day_plan, int(start_transfer.get("duration_minutes") or 0), constraints)
-            first_after_trim = day_plan["blocks"][0] if day_plan["blocks"] else None
-            if first_after_trim and first_after_trim.get("id") != start_transfer.get("to"):
-                start_transfer = _build_start_transfer(constraints, first_after_trim)
-            if start_transfer:
-                day_plan = _inject_start_block(day_plan, start_transfer, constraints)
-        actual_duration = sum(day.get("total_duration", 0) for day in day_plan["days"])
-        actual_price = sum(block.get("price", 0) for block in day_plan["blocks"])
-        return {
-            "blocks": day_plan["blocks"],
-            "connections": day_plan["connections"],
-            "days": day_plan["days"],
-            "total_duration": actual_duration or plan["score"].get("total_duration_s", 0) // 60,
-            "total_price": actual_price or plan["score"].get("total_cost", 0),
-            "score": plan["score"].get("route_score", 0),
-            "plan_name": _display_plan_name(plan["name"], constraints),
-            "style": plan.get("style", plan["name"]),
-            "highlights": _display_highlights(plan.get("highlights", []), constraints),
-            "total_distance": plan["score"].get("total_distance_m", 0) + int((start_transfer or {}).get("distance_m") or 0),
-            "time_plan": constraints.get("time_strategy", {}),
-            "event_suggestions": event_suggestions,
-            "upgrade_suggestions": upgrade_suggestions,
-            "guide_signals": guide_signals,
-            "map_pois": _build_map_pois(pois, plan["route"], people_count),
-            "start_transfer": start_transfer,
-        }
+    built_itineraries = [
+        build_itinerary_from_plan(
+            plan,
+            matrix,
+            constraints,
+            people_count=people_count,
+            transport_mode=transport_mode,
+            event_suggestions=event_suggestions,
+            upgrade_suggestions=upgrade_suggestions,
+            guide_signals=guide_signals,
+            all_pois=pois,
+            include_route_details=False,
+            include_start_detail=True,
+        )
+        for plan in plans
+    ]
 
-    itinerary = to_itinerary(plans[0])
-    alternatives = [to_itinerary(plan) for plan in plans[1:]]
+    if _budget_limit_value(constraints):
+        budget_safe_itineraries = [
+            itinerary for itinerary in built_itineraries
+            if _itinerary_within_budget(itinerary, constraints)
+        ]
+        if not budget_safe_itineraries:
+            _log("optimize", "没有找到预算内方案")
+            return {"itinerary": None, "alternative_plans": []}
+        built_itineraries = budget_safe_itineraries
+
+    itinerary = built_itineraries[0]
+    alternatives = built_itineraries[1:]
     itinerary["alternatives"] = alternatives
 
     return {
@@ -1654,7 +1766,7 @@ def optimize_route_node(state: PlannerState) -> dict:
     }
 
 
-def _build_start_transfer(constraints: dict, first_block: dict | None) -> dict | None:
+def _build_start_transfer(constraints: dict, first_block: dict | None, include_details: bool = True) -> dict | None:
     start = _parse_lnglat(str(constraints.get("start_location") or ""))
     if not start or not first_block or first_block.get("lng") is None or first_block.get("lat") is None:
         return None
@@ -1695,18 +1807,34 @@ def _build_start_transfer(constraints: dict, first_block: dict | None) -> dict |
         "duration_minutes": minutes,
         "mode": mode_en if english else mode_zh,
     }
-    try:
-        from tools.amap import fetch_direction_polyline
+    if not include_details:
+        return transfer
 
+    try:
+        from tools.amap import fetch_direction_polyline, fetch_transit_plan
+
+        origin = f"{start[0]},{start[1]}"
+        destination = f"{first_block.get('lng')},{first_block.get('lat')}"
+        transit_detail = None
+        if mode_zh == "公共交通":
+            transit_detail = fetch_transit_plan(
+                origin,
+                destination,
+                str(constraints.get("adcode") or constraints.get("city") or ""),
+                str(constraints.get("adcode") or constraints.get("city") or ""),
+            )
+            if transit_detail:
+                transfer["transit_detail"] = transit_detail
+                if transit_detail.get("duration"):
+                    transfer["time"] = transit_detail["duration"] if not english else transit_detail["duration"].replace("分钟", "min")
+                if transit_detail.get("route_path"):
+                    transfer["route_path"] = transit_detail["route_path"]
+                    transfer["route_path_source"] = "amap_transit"
         path_mode = "walking" if distance_m <= 1200 else "driving"
-        route_path = fetch_direction_polyline(
-            f"{start[0]},{start[1]}",
-            f"{first_block.get('lng')},{first_block.get('lat')}",
-            path_mode,
-        )
+        route_path = transfer.get("route_path") or fetch_direction_polyline(origin, destination, path_mode)
         if route_path:
             transfer["route_path"] = route_path
-            if path_mode == "driving" and distance_m > 1200:
+            if not transfer.get("route_path_source") and path_mode == "driving" and distance_m > 1200:
                 transfer["route_path_source"] = "driving_fallback"
     except Exception:
         pass
@@ -1760,24 +1888,29 @@ def _inject_start_block(day_plan: dict, start_transfer: dict, constraints: dict)
 
 
 def _apply_start_transfer_to_day_plan(day_plan: dict, minutes: int, constraints: dict) -> dict:
-    if minutes <= 0 or minutes > 90:
+    # A local cross-district transit leg can easily exceed 90 minutes. Only
+    # ignore extreme values that would represent intercity travel or bad data.
+    if minutes <= 0 or minutes > 240:
         return day_plan
-    shifted_ids = set()
-    for block in day_plan.get("blocks", []):
-        if block.get("day_index") != 1:
-            continue
-        block_id = block.get("id")
-        if block_id in shifted_ids:
-            continue
+    shifted_objects = set()
+
+    def shift_block(block: dict) -> None:
+        if id(block) in shifted_objects or block.get("day_index") != 1:
+            return
         if block.get("start_time"):
             block["start_time"] = _format_minutes(_parse_time_to_minutes(block["start_time"]) + minutes)
         if block.get("end_time"):
             block["end_time"] = _format_minutes(_parse_time_to_minutes(block["end_time"]) + minutes)
-        shifted_ids.add(block_id)
+        shifted_objects.add(id(block))
+
+    for block in day_plan.get("blocks", []):
+        shift_block(block)
 
     for day in day_plan.get("days", []):
         if day.get("day_index") != 1:
             continue
+        for block in day.get("blocks", []):
+            shift_block(block)
         if day.get("end_time"):
             day["end_time"] = _format_minutes(_parse_time_to_minutes(day["end_time"]) + minutes)
         day["total_duration"] = int(day.get("total_duration") or 0) + minutes
@@ -1789,7 +1922,18 @@ def _apply_start_transfer_to_day_plan(day_plan: dict, minutes: int, constraints:
 def _trim_day_to_end_window(day_plan: dict, day: dict, constraints: dict) -> None:
     end_limit = _parse_time_to_minutes(constraints.get("daily_end_time", "20:30")) + 15
     day_blocks = day.get("blocks") or []
-    while day_blocks and _parse_time_to_minutes(day_blocks[-1].get("end_time", "00:00")) > end_limit:
+    trip_days = max(1, int(constraints.get("trip_days") or 1))
+    duration = int(constraints.get("daily_duration_minutes") or constraints.get("duration_minutes") or 0)
+    min_visible_blocks = 4 if trip_days == 1 and duration >= 240 else 3
+
+    def visible_block_count() -> int:
+        return sum(1 for block in day_blocks if not block.get("is_start"))
+
+    while (
+        day_blocks
+        and visible_block_count() > min_visible_blocks
+        and _parse_time_to_minutes(day_blocks[-1].get("end_time", "00:00")) > end_limit
+    ):
         removed = day_blocks.pop()
         removed_id = removed.get("id")
         day_plan["blocks"] = [block for block in day_plan.get("blocks", []) if block.get("id") != removed_id]
@@ -1881,17 +2025,15 @@ def _local_explanation(itinerary: dict, alternatives: list[dict], constraints: d
     names = " → ".join(block.get("name", "") for block in blocks)
     budget = constraints.get("budget")
     people = constraints.get("people_count") or 1
-    prefs = "、".join(constraints.get("preferences") or ["综合体验"])
+    prefs = _display_preferences(constraints.get("preferences") or ["综合体验"], constraints)
     if constraints.get("language") == "en":
         start_transfer = itinerary.get("start_transfer")
         lines = [
-            f"## {itinerary.get('plan_name', 'Recommended Route')}",
+            f"## {_display_plan_name(itinerary.get('plan_name', 'Recommended Route'), constraints)}",
             f"Route: {names}",
             f"- Estimated duration: {itinerary.get('total_duration', 0)} min",
             f"- Estimated cost: ¥{itinerary.get('total_price', 0)} total for {people}",
             f"- Preference match: {prefs}",
-            f"- Strategy profile: {(constraints.get('persona_strategy') or {}).get('name', 'Balanced explorer')}",
-            f"- Time strategy: {constraints.get('time_strategy', {}).get('note', 'Split by available time windows')}",
         ]
         if start_transfer:
             lines.append(
@@ -1900,12 +2042,12 @@ def _local_explanation(itinerary: dict, alternatives: list[dict], constraints: d
             )
         if budget:
             remain = budget - itinerary.get("total_price", 0)
-            lines.append(f"- Budget check: budget ¥{budget}, remaining about ¥{max(remain, 0)}; strategy={constraints.get('budget_level', 'balanced')}")
+            lines.append(f"- Budget: within ¥{budget}, about ¥{max(remain, 0)} left for optional upgrades.")
         if alternatives:
             lines.append("\n### Other Options")
             for alt in alternatives[:3]:
                 lines.append(
-                    f"- **{alt.get('plan_name')}**: {len(alt.get('blocks', []))} stops, "
+                    f"- **{_display_plan_name(alt.get('plan_name', ''), constraints)}**: {len(alt.get('blocks', []))} stops, "
                     f"{alt.get('total_duration', 0)} min, ¥{alt.get('total_price', 0)}"
                 )
         if itinerary.get("upgrade_suggestions"):
@@ -1922,8 +2064,6 @@ def _local_explanation(itinerary: dict, alternatives: list[dict], constraints: d
         f"- 预计总时长：{itinerary.get('total_duration', 0)} 分钟",
         f"- 预计总花费：¥{itinerary.get('total_price', 0)}（{people}人合计）",
         f"- 匹配偏好：{prefs}",
-        f"- 人群策略：{(constraints.get('persona_strategy') or {}).get('name', '综合探索型')}",
-        f"- 时间策略：{constraints.get('time_strategy', {}).get('note', '按可用时间拆分安排')}",
     ]
     if start_transfer:
         lines.append(
@@ -1932,7 +2072,7 @@ def _local_explanation(itinerary: dict, alternatives: list[dict], constraints: d
         )
     if budget:
         remain = budget - itinerary.get("total_price", 0)
-        lines.append(f"- 预算判断：预算 ¥{budget}，预计剩余 ¥{max(remain, 0)}；策略为 {constraints.get('budget_note', '按预算选择合适消费强度')}")
+        lines.append(f"- 预算：控制在 ¥{budget} 内，约剩 ¥{max(remain, 0)} 可用于临时加餐或升级体验")
     if alternatives:
         lines.append("\n### 其他可选方案")
         for alt in alternatives[:3]:
@@ -1961,7 +2101,14 @@ def explain_node(state: PlannerState, llm) -> dict:
     return {"messages": [AIMessage(content=content)]}
 
 
-def _duration_for_category(category: str) -> int:
+def _duration_for_category(category: str, name: str = "", tags: list[str] | None = None, address: str = "") -> int:
+    text = " ".join([str(name or ""), str(category or ""), str(address or ""), *map(str, tags or [])])
+    if any(keyword in text for keyword in ["商圈", "步行街", "商业街", "购物中心", "太古汇", "万象城", "K11", "天河城", "正佳", "北京路", "上下九", "市桥"]):
+        return 120
+    if any(keyword in text for keyword in ["广场", "古镇", "老街", "景区"]):
+        return 95
+    if category == "购物":
+        return 105
     return {
         "咖啡": 35,
         "餐厅": 65,
@@ -2026,7 +2173,7 @@ def _build_blocks(route: list[dict], people_count: int = 1) -> list[dict]:
             "icon": _get_category_icon(category),
             "lng": poi.get("lng"),
             "lat": poi.get("lat"),
-            "duration": _duration_for_category(category),
+            "duration": _duration_for_category(category, str(poi.get("name") or ""), tags, str(poi.get("address") or "")),
             "price": unit_price * people_count,
             "unit_price": unit_price,
             "rating": poi.get("rating", 0),
@@ -2124,7 +2271,8 @@ def _split_into_days(blocks: list[dict], connections: list[dict], constraints: d
             block = {**blocks[block_index]}
             block["day_index"] = day_index
             aligned_min = _align_block_start_time(block, current_min, infer_food_time_slot(block))
-            min_day_stops = max(3, min(target_count, daily_budget // 95))
+            min_floor = 4 if trip_days == 1 and daily_budget >= 240 else 3
+            min_day_stops = max(min_floor, min(target_count, daily_budget // 95))
             if day_blocks and len(day_blocks) >= min_day_stops and aligned_min + block.get("duration", 60) > end_min + 45:
                 break
             current_min = aligned_min
@@ -2224,13 +2372,23 @@ def _format_minutes(value: int) -> str:
 
 
 def _connection_minutes(conn: dict) -> int:
-    text = conn.get("time", "")
+    duration = conn.get("duration_minutes")
+    if isinstance(duration, (int, float)) and duration > 0:
+        return int(duration)
+
+    text = str(conn.get("time", "") or "")
     hour_match = re.search(r"(\d+)小时(?:(\d+)分钟)?", text)
     if hour_match:
         return int(hour_match.group(1)) * 60 + int(hour_match.group(2) or 0)
     minute_match = re.search(r"(\d+)分钟", text)
     if minute_match:
         return int(minute_match.group(1))
+    en_hour_match = re.search(r"(\d+)\s*(?:h|hour|hours)(?:\s*(\d+)\s*(?:m|min|mins|minute|minutes))?", text, re.I)
+    if en_hour_match:
+        return int(en_hour_match.group(1)) * 60 + int(en_hour_match.group(2) or 0)
+    en_minute_match = re.search(r"(\d+)\s*(?:m|min|mins|minute|minutes)", text, re.I)
+    if en_minute_match:
+        return int(en_minute_match.group(1))
     return 15
 
 
@@ -2267,9 +2425,39 @@ def _get_frontend_type(category: str) -> str:
     return mapping.get(category, "scenic")
 
 
-def _build_connections(route: list[dict], matrix: dict = None, mode: str = "walking", constraints: dict | None = None) -> list[dict]:
-    mode_label = {"walking": "步行", "bicycling": "骑行", "driving": "驾车", "transit": "公共交通"}.get(mode, "步行")
-    shape_mode = mode if mode in {"walking", "bicycling", "driving"} else ("driving" if mode == "transit" else None)
+def _format_connection_time(minutes: int) -> str:
+    minutes = max(1, int(minutes))
+    return f"{minutes}分钟" if minutes < 60 else f"{minutes // 60}小时{minutes % 60}分钟"
+
+
+def _estimate_transit_minutes_for_distance(distance_m: int | float | None) -> int:
+    if not distance_m:
+        return 18
+    distance_m = float(distance_m)
+    if distance_m <= 1600:
+        return max(8, round(distance_m / 75))
+    if distance_m <= 5000:
+        return max(14, round(distance_m / 360) + 7)
+    return max(24, round(distance_m / 430) + 12)
+
+
+def _use_transit_for_long_walk(mode: str, distance_m: int | float | None, minutes: int | None) -> bool:
+    if mode != "walking":
+        return False
+    if minutes is not None and minutes > 20:
+        return True
+    return bool(distance_m and distance_m > 1600)
+
+
+def _build_connections(
+    route: list[dict],
+    matrix: dict = None,
+    mode: str = "walking",
+    constraints: dict | None = None,
+    include_details: bool = True,
+) -> list[dict]:
+    base_mode_label = {"walking": "步行", "bicycling": "骑行", "driving": "驾车", "transit": "公共交通"}.get(mode, "步行")
+    base_shape_mode = mode if mode in {"walking", "bicycling", "driving"} else None
     constraints = constraints or {}
     connections = []
     try:
@@ -2281,35 +2469,52 @@ def _build_connections(route: list[dict], matrix: dict = None, mode: str = "walk
         from_id = route[i]["id"]
         to_id = route[i + 1]["id"]
         key = (from_id, to_id)
+        dist_m = None
+        minutes = None
 
         if matrix and key in matrix:
             dist_m = matrix[key]["distance_m"]
             dur_s = matrix[key]["duration_s"]
             distance = f"{dist_m}m" if dist_m < 1000 else f"{dist_m / 1000:.1f}km"
             minutes = max(1, dur_s // 60)
-            time = f"{minutes}分钟" if minutes < 60 else f"{minutes // 60}小时{minutes % 60}分钟"
+            time = _format_connection_time(minutes)
         else:
             distance = "未知"
             time = "未知"
 
+        leg_mode = mode
+        leg_mode_label = base_mode_label
+        leg_shape_mode = base_shape_mode
+        if _use_transit_for_long_walk(mode, dist_m, minutes):
+            leg_mode = "transit"
+            leg_mode_label = "公共交通"
+            leg_shape_mode = None
+            minutes = _estimate_transit_minutes_for_distance(dist_m)
+            time = _format_connection_time(minutes)
+
         connection = {
             "from": from_id,
             "to": to_id,
+            "from_name": route[i].get("name"),
+            "to_name": route[i + 1].get("name"),
+            "from_lng": route[i].get("lng"),
+            "from_lat": route[i].get("lat"),
+            "to_lng": route[i + 1].get("lng"),
+            "to_lat": route[i + 1].get("lat"),
             "distance": distance,
             "time": time,
-            "mode": mode_label,
+            "duration_minutes": minutes,
+            "distance_m": dist_m,
+            "mode": leg_mode_label,
+            "city": constraints.get("adcode") or constraints.get("city") or "",
         }
-        if shape_mode and fetch_direction_polyline:
-            origin = f"{route[i].get('lng')},{route[i].get('lat')}"
-            destination = f"{route[i + 1].get('lng')},{route[i + 1].get('lat')}"
-            path = fetch_direction_polyline(origin, destination, shape_mode)
-            if path:
-                connection["route_path"] = path
-                if mode == "transit" and shape_mode == "driving":
-                    connection["route_path_source"] = "driving_fallback"
-        if mode == "transit" and fetch_transit_plan:
-            origin = f"{route[i].get('lng')},{route[i].get('lat')}"
-            destination = f"{route[i + 1].get('lng')},{route[i + 1].get('lat')}"
+        if not include_details:
+            connections.append(connection)
+            continue
+
+        origin = f"{route[i].get('lng')},{route[i].get('lat')}"
+        destination = f"{route[i + 1].get('lng')},{route[i + 1].get('lat')}"
+        if leg_mode == "transit" and fetch_transit_plan:
             try:
                 transit_detail = fetch_transit_plan(
                     origin,
@@ -2321,6 +2526,15 @@ def _build_connections(route: list[dict], matrix: dict = None, mode: str = "walk
                 transit_detail = None
             if transit_detail:
                 connection["transit_detail"] = transit_detail
+                if transit_detail.get("duration"):
+                    connection["time"] = transit_detail["duration"]
+                if transit_detail.get("route_path"):
+                    connection["route_path"] = transit_detail["route_path"]
+                    connection["route_path_source"] = "amap_transit"
+        elif leg_shape_mode and fetch_direction_polyline:
+            path = fetch_direction_polyline(origin, destination, leg_shape_mode)
+            if path:
+                connection["route_path"] = path
         connections.append(connection)
     return connections
 

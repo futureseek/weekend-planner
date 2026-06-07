@@ -122,7 +122,7 @@ const PREFERENCE_PRESETS: Record<Language, Array<{ title: string; detail: string
     },
     {
       title: "Family easy",
-      detail: "Less backtracking · breaks",
+      detail: "Less backtracking · more breaks",
       value: "Family or older travelers; keep the route easy with fewer backtracks, more breaks and meal buffers",
       tone: "border-rose-200 bg-rose-50 text-rose-900",
     },
@@ -174,17 +174,20 @@ const CHAT_TEXT = {
     districtFailed: "区县加载失败，请确认后端和高德 Key",
     startSearching: "正在搜索起点...",
     startNoResult: "没有找到匹配地点，可换成更完整的地点名",
+    startManualHint: "请输入起点并从搜索结果中选择",
+    cityLocating: "正在识别当前城市...",
+    cityLocated: "已识别当前城市：{city}",
     enterHint: "偏好框支持 Enter 发送",
     city: "城市",
     cityPlaceholder: "如 广州",
     checkDistricts: "查区",
     startPoint: "起点",
-    startPointPlaceholder: "默认使用当前位置，也可输入地点搜索",
+    startPointPlaceholder: "请输入起点，如体育西路地铁站",
     dates: "出行日期",
     dailyTime: "时间",
     budget: "预算/元",
     people: "人数",
-    districts: "考虑区县，可多选",
+    districts: "建议优先选 1 个区县，最多 2 个更稳",
     preferencePlaceholder: "写具体一点：想吃顿好的、晚上看夜景、少排队、不要太赶、想打游戏或看展",
     submit: "生成路线",
     cancel: "取消",
@@ -215,17 +218,20 @@ const CHAT_TEXT = {
     districtFailed: "District loading failed. Check backend and AMap key.",
     startSearching: "Searching start point...",
     startNoResult: "No matched places. Try a more specific name.",
+    startManualHint: "Type a start point and choose a search result",
+    cityLocating: "Detecting current city...",
+    cityLocated: "Detected current city: {city}",
     enterHint: "Press Enter in preferences to send",
     city: "City",
     cityPlaceholder: "e.g. Guangzhou",
     checkDistricts: "Load areas",
     startPoint: "Start point",
-    startPointPlaceholder: "Defaults to current location, or type a place",
+    startPointPlaceholder: "Type a start point, e.g. a campus or metro station",
     dates: "Travel dates",
     dailyTime: "Time",
     budget: "Budget/CNY",
     people: "People",
-    districts: "Districts to consider, multi-select",
+    districts: "Pick 1 district for speed; 2 max recommended",
     preferencePlaceholder: "Be specific: better dinner, night views, fewer queues, relaxed pace, gaming or exhibitions",
     submit: "Generate",
     cancel: "Cancel",
@@ -249,6 +255,7 @@ interface LocationInfo {
   adcode?: string;
   original_location?: string;
   anchor_distance_m?: number;
+  browser_accuracy_m?: number;
   source?: string;
 }
 
@@ -297,12 +304,12 @@ function formatAddress(info: LocationInfo) {
 function formatLocationLabel(info: LocationInfo, language: Language = "zh") {
   const name = firstText(info.name);
   if (name) return name;
+  const address = formatAddress(info);
+  if (address) return address;
   const city = firstText(info.city).replace(/市$/, "");
   const district = firstText(info.district).replace(/区$/, "");
   if (city && district && city !== district) return `${city}${district}`;
   if (city || district) return city || district;
-  const address = formatAddress(info);
-  if (address) return address;
   return CHAT_TEXT[language].currentNear;
 }
 
@@ -319,8 +326,161 @@ function formatSuggestionSub(item: GeocodeSuggestion) {
   return [address, firstText(item.city), firstText(item.district), sourceLabel].filter(Boolean).join(" · ");
 }
 
-function isCurrentLocationKeyword(value: string) {
-  return /^(当前位置|当前定位|我的位置|current location|my location)$/i.test(value.trim());
+const MAX_LOCATION_ACCURACY_M = 30;
+const AMAP_JS_KEY = process.env.NEXT_PUBLIC_AMAP_JS_KEY || "";
+const AMAP_SECURITY_JS_CODE = process.env.NEXT_PUBLIC_AMAP_SECURITY_JS_CODE || "";
+
+function formatMeters(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}km` : `${Math.round(value)}m`;
+}
+
+type BrowserLocationCandidate = {
+  location: string;
+  accuracy: number;
+  name?: string;
+  formatted_address?: string;
+  city?: string;
+  district?: string;
+  adcode?: string;
+  source: "amap_js" | "browser";
+};
+
+function readAmapLngLat(position: unknown) {
+  const record = position as Record<string, unknown> | null;
+  if (!record) return null;
+  const lng = typeof record.getLng === "function" ? record.getLng() : record.lng;
+  const lat = typeof record.getLat === "function" ? record.getLat() : record.lat;
+  if (typeof lng !== "number" || typeof lat !== "number") return null;
+  return { lng, lat };
+}
+
+function loadAmapSdk() {
+  if (!AMAP_JS_KEY || typeof window === "undefined") return Promise.reject(new Error("missing amap js key"));
+  const scopedWindow = window as typeof window & {
+    AMap?: any;
+    _AMapSecurityConfig?: { securityJsCode?: string };
+    __roamAmapLoading?: Promise<any>;
+    __roamAmapReady?: () => void;
+  };
+  if (scopedWindow.AMap?.Geolocation) return Promise.resolve(scopedWindow.AMap);
+  if (scopedWindow.__roamAmapLoading) return scopedWindow.__roamAmapLoading;
+  if (AMAP_SECURITY_JS_CODE) {
+    scopedWindow._AMapSecurityConfig = { securityJsCode: AMAP_SECURITY_JS_CODE };
+  }
+  scopedWindow.__roamAmapLoading = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    scopedWindow.__roamAmapReady = () => resolve(scopedWindow.AMap);
+    script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(AMAP_JS_KEY)}&plugin=AMap.Geolocation&callback=__roamAmapReady`;
+    script.async = true;
+    script.onerror = () => reject(new Error("amap js load failed"));
+    document.head.appendChild(script);
+  });
+  return scopedWindow.__roamAmapLoading;
+}
+
+async function locateByAmapJs(): Promise<BrowserLocationCandidate> {
+  const AMap = await loadAmapSdk();
+  return new Promise((resolve, reject) => {
+    const geolocation = new AMap.Geolocation({
+      enableHighAccuracy: true,
+      timeout: 12000,
+      zoomToAccuracy: false,
+      showButton: false,
+      showMarker: false,
+      noIpLocate: 3,
+      noGeoLocation: 0,
+    });
+    geolocation.getCurrentPosition((status: string, result: any) => {
+      if (status !== "complete") {
+        reject(new Error(result?.message || "amap geolocation failed"));
+        return;
+      }
+      const position = readAmapLngLat(result?.position);
+      if (!position) {
+        reject(new Error("amap position missing"));
+        return;
+      }
+      const address = result?.addressComponent || {};
+      resolve({
+        location: `${position.lng.toFixed(6)},${position.lat.toFixed(6)}`,
+        accuracy: Number.isFinite(result?.accuracy) ? Math.round(result.accuracy) : 0,
+        formatted_address: result?.formattedAddress || "",
+        city: firstText(address.city).replace(/市$/, ""),
+        district: firstText(address.district),
+        adcode: address.adcode || "",
+        source: "amap_js",
+      });
+    });
+  });
+}
+
+function locateByBrowser(): Promise<BrowserLocationCandidate> {
+  if (!("geolocation" in navigator)) return Promise.reject(new Error("browser geolocation unsupported"));
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      (pos) => resolve({
+        location: `${pos.coords.longitude.toFixed(6)},${pos.coords.latitude.toFixed(6)}`,
+        accuracy: Number.isFinite(pos.coords.accuracy) ? Math.round(pos.coords.accuracy) : 0,
+        source: "browser",
+      }),
+      () => reject(new Error("browser geolocation failed")),
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 }
+    );
+  });
+}
+
+function locationAccuracy(candidate: BrowserLocationCandidate) {
+  return candidate.accuracy && Number.isFinite(candidate.accuracy)
+    ? candidate.accuracy
+    : Number.POSITIVE_INFINITY;
+}
+
+async function locateBestCandidate(): Promise<BrowserLocationCandidate> {
+  const candidates: BrowserLocationCandidate[] = [];
+
+  if (AMAP_JS_KEY) {
+    try {
+      const amapCandidate = await locateByAmapJs();
+      candidates.push(amapCandidate);
+      if (locationAccuracy(amapCandidate) <= MAX_LOCATION_ACCURACY_M) return amapCandidate;
+    } catch {
+      // Continue with browser geolocation below; AMap may fail or only expose coarse IP-level data.
+    }
+  }
+
+  if ("geolocation" in navigator) {
+    try {
+      const browserCandidate = await locateByBrowser();
+      candidates.push(browserCandidate);
+      if (locationAccuracy(browserCandidate) <= MAX_LOCATION_ACCURACY_M) return browserCandidate;
+    } catch {
+      // Fall through and report the best coarse candidate if we have one.
+    }
+  }
+
+  if (candidates.length) {
+    candidates.sort((a, b) => locationAccuracy(a) - locationAccuracy(b));
+    return candidates[0];
+  }
+
+  return Promise.reject(new Error("geolocation unsupported"));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 function formatDateForMessage(value: string, language: Language = "zh") {
@@ -348,11 +508,9 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadingTextIndex, setLoadingTextIndex] = useState(0);
-  const [oneShotLocation, setOneShotLocation] = useState<LocationInfo | null>(null);
-  const [pendingLocation, setPendingLocation] = useState<LocationInfo | null>(null);
-  const [geoStatus, setGeoStatus] = useState(text.geoReady);
   const [cityName, setCityName] = useState("");
   const [startPoint, setStartPoint] = useState("");
+  const [selectedStartSuggestion, setSelectedStartSuggestion] = useState<GeocodeSuggestion | null>(null);
   const [startSuggestions, setStartSuggestions] = useState<GeocodeSuggestion[]>([]);
   const [startSearchStatus, setStartSearchStatus] = useState("");
   const [districtOptions, setDistrictOptions] = useState<DistrictOption[]>([]);
@@ -364,11 +522,10 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
   const [endTime, setEndTime] = useState("22:00");
   const [budgetAmount, setBudgetAmount] = useState("300");
   const [peopleAmount, setPeopleAmount] = useState("1");
-  const [composerHeight, setComposerHeight] = useState(360);
+  const [composerHeight, setComposerHeight] = useState(405);
   const [loadingPlanIndex, setLoadingPlanIndex] = useState<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
-  const currentLocationRequestRef = useRef("");
   const autoLocationStartedRef = useRef(false);
   const startSearchSeqRef = useRef(0);
   const startSearchCacheRef = useRef<Map<string, GeocodeSuggestion[]>>(new Map());
@@ -389,18 +546,10 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
   }, [loading, loadingTexts.length]);
 
   useEffect(() => {
-    if (!("geolocation" in navigator)) setGeoStatus(text.geoUnsupported);
-  }, [text.geoUnsupported]);
-
-  useEffect(() => {
-    if (!oneShotLocation && !pendingLocation) setGeoStatus(text.geoReady);
-  }, [language, oneShotLocation, pendingLocation, text.geoReady]);
-
-  useEffect(() => {
     const handleMouseMove = (event: MouseEvent) => {
       if (!resizeRef.current) return;
       const delta = resizeRef.current.startY - event.clientY;
-      setComposerHeight(Math.min(560, Math.max(290, resizeRef.current.startHeight + delta)));
+      setComposerHeight(Math.min(620, Math.max(405, resizeRef.current.startHeight + delta)));
     };
     const handleMouseUp = () => {
       resizeRef.current = null;
@@ -432,20 +581,9 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
     setLoading(true);
 
     try {
-      const locationForThisSend = oneShotLocation;
-      const shouldUseOneShotLocation = Boolean(locationForThisSend)
-        && !trimmed.includes("当前位置:")
-        && !trimmed.includes("当前位置：")
-        && !trimmed.includes("起点：")
-        && !trimmed.includes("Start point:");
-      const enrichedText = shouldUseOneShotLocation
-        ? language === "en"
-          ? `Start point:${locationForThisSend!.location}, ${formatLocationLabel(locationForThisSend!, language)}\n${trimmed}`
-          : `当前位置:${locationForThisSend!.location}，${formatLocationLabel(locationForThisSend!, language)}，${trimmed}`
-        : trimmed;
       const data = await apiPost<{ reply: string; itinerary?: Itinerary; alternatives?: Itinerary[] }>(
         "/api/chat",
-        { message: enrichedText, session_id: sessionId },
+        { message: trimmed, session_id: sessionId },
         { timeoutMs: 120000 }
       );
 
@@ -466,13 +604,8 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
       ]);
     } finally {
       setLoading(false);
-      if (oneShotLocation) {
-        setOneShotLocation(null);
-        setStartPoint("");
-        setGeoStatus(text.geoReady);
-      }
     }
-  }, [language, loading, oneShotLocation, onItinerary, sessionId, text.backendFallback, text.geoReady, text.routeReady, text.serviceRetry]);
+  }, [loading, onItinerary, sessionId, text.backendFallback, text.routeReady, text.serviceRetry]);
 
   useEffect(() => {
     onReady?.(sendText, addExternalMessage);
@@ -531,18 +664,15 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
       : startDate ? formatDateForMessage(startDate, language) : "";
     const timeRange = startTime && endTime ? `${startTime}-${endTime}` : "";
     const preferences = input.trim();
-    const startForBackend = oneShotLocation
-      ? `${oneShotLocation.location}，${formatLocationLabel(oneShotLocation, language)}`
-      : startPoint.trim();
-    const startForDisplay = oneShotLocation
-      ? formatLocationLabel(oneShotLocation, language)
-      : startPoint.trim();
-    const start = forBackend ? startForBackend : startForDisplay;
+    const start = startPoint.trim();
+    const backendStart = forBackend && selectedStartSuggestion?.location
+      ? `${selectedStartSuggestion.location}，${start}`
+      : start;
     if (language === "en") {
       const lines = [
         city ? `City: ${city}` : "",
         areas ? `Districts: ${areas}` : "",
-        start ? `Start point: ${start}` : "",
+        start ? `Start point: ${backendStart}` : "",
         dateRange ? `Travel dates: ${dateRange}` : "",
         timeRange ? `Time: ${timeRange}` : "",
         budgetAmount ? `Budget: ${budgetAmount} CNY` : "",
@@ -555,7 +685,7 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
     const lines = [
       city ? `城市：${city}` : "",
       areas ? `考虑区县：${areas}` : "",
-      start ? `起点：${start}` : "",
+      start ? `起点：${backendStart}` : "",
       dateRange ? `出行日期：${dateRange}` : "",
       timeRange ? `时间：${timeRange}` : "",
       budgetAmount ? `预算：${budgetAmount}元` : "",
@@ -569,6 +699,7 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
   const hasStructuredCore = Boolean(
     cityName.trim() &&
     selectedDistricts.length > 0 &&
+    Boolean(startPoint.trim()) &&
     startDate &&
     endDate &&
     startTime &&
@@ -577,64 +708,69 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
     peopleAmount
   );
 
-  const requestCurrentLocation = () => {
-    if (!("geolocation" in navigator)) {
-      setGeoStatus(text.geoUnsupported);
+  const requestCurrentCity = () => {
+    if (!AMAP_JS_KEY && !("geolocation" in navigator)) {
       return;
     }
-    setGeoStatus(text.geoLocating);
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const location = `${pos.coords.longitude.toFixed(6)},${pos.coords.latitude.toFixed(6)}`;
-        setGeoStatus(text.geoReverse);
+    setDistrictStatus(text.cityLocating);
+    const locate = withTimeout(locateBestCandidate(), 9000, "city detection timed out");
+
+    locate
+      .then(async (candidate) => {
+        const { location } = candidate;
         try {
           const data = await apiPost<Omit<LocationInfo, "location"> & { location?: string }>(
             "/api/location/reverse",
-            { location },
+            {
+              location,
+              accuracy_m: candidate.accuracy,
+              city_only: true,
+              provider: candidate.source,
+              fallback_address: candidate.formatted_address,
+              fallback_city: candidate.city,
+              fallback_district: candidate.district,
+              fallback_adcode: candidate.adcode,
+            },
             { timeoutMs: 7000 }
           );
-          const resolved = { ...data, location: data.location || location };
-          const label = formatLocationLabel(resolved, language);
-          const resolvedCity = firstText(resolved.city).replace(/市$/, "");
-          const resolvedDistrict = firstText(resolved.district);
-          setOneShotLocation(resolved);
-          setStartPoint(label);
-          setPendingLocation(null);
-          const anchorDistance = typeof resolved.anchor_distance_m === "number" ? resolved.anchor_distance_m : null;
-          setGeoStatus(
-            language === "en"
-              ? `Start set: ${label}${anchorDistance !== null ? ` · ${anchorDistance}m from you` : ""}`
-              : `已设置起点：${label}${anchorDistance !== null ? ` · 距你约${anchorDistance}m` : ""}`
-          );
+          const resolvedCity = firstText(data.city || candidate.city).replace(/市$/, "");
+          const resolvedDistrict = firstText(data.district || candidate.district);
           if (!cityName.trim() && resolvedCity) {
             setCityName(resolvedCity);
             fetchDistricts(resolvedCity, resolvedDistrict);
+            setDistrictStatus(text.cityLocated.replace("{city}", resolvedCity));
           }
         } catch {
-          const resolved = { location };
-          setOneShotLocation(resolved);
-          setStartPoint(text.currentNear);
-          setPendingLocation(null);
-          setGeoStatus(language === "en" ? "Start set from browser coordinates" : "已用浏览器坐标设置起点");
+          const resolvedCity = firstText(candidate.city).replace(/市$/, "");
+          const resolvedDistrict = firstText(candidate.district);
+          if (!cityName.trim() && resolvedCity) {
+            setCityName(resolvedCity);
+            fetchDistricts(resolvedCity, resolvedDistrict);
+            setDistrictStatus(text.cityLocated.replace("{city}", resolvedCity));
+          } else {
+            setDistrictStatus("");
+          }
         }
-      },
-      () => setGeoStatus(text.geoFailed),
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 5 * 60 * 1000 }
-    );
+      })
+      .catch(() => setDistrictStatus(""));
   };
 
   useEffect(() => {
     if (autoLocationStartedRef.current || !("geolocation" in navigator)) return;
     autoLocationStartedRef.current = true;
-    requestCurrentLocation();
+    requestCurrentCity();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     const keyword = startPoint.trim();
-    if (!keyword || keyword.length < 2 || oneShotLocation || isCurrentLocationKeyword(keyword)) {
+    if (!keyword || keyword.length < 2) {
       setStartSuggestions([]);
       setStartSearchStatus("");
+      return;
+    }
+    if (selectedStartSuggestion && keyword === formatSuggestionTitle(selectedStartSuggestion, language)) {
+      setStartSuggestions([]);
       return;
     }
     const cacheKey = `${normalizeCityForLookup(cityName)}|${keyword}`.toLowerCase();
@@ -664,26 +800,20 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
       }
     }, 220);
     return () => window.clearTimeout(timer);
-  }, [cityName, oneShotLocation, startPoint, text.startNoResult, text.startSearching]);
+  }, [cityName, language, selectedStartSuggestion, startPoint, text.startNoResult, text.startSearching]);
 
   const handleStartPointChange = (value: string) => {
     setStartPoint(value);
+    setSelectedStartSuggestion(null);
     setStartSearchStatus("");
-    if (oneShotLocation) setOneShotLocation(null);
-    if (isCurrentLocationKeyword(value) && currentLocationRequestRef.current !== value.trim()) {
-      currentLocationRequestRef.current = value.trim();
-      requestCurrentLocation();
-    } else if (!isCurrentLocationKeyword(value)) {
-      currentLocationRequestRef.current = "";
-    }
   };
 
   const selectStartSuggestion = (item: GeocodeSuggestion) => {
     const label = formatSuggestionTitle(item, language);
-    setOneShotLocation(item);
     setStartPoint(label);
+    setSelectedStartSuggestion(item);
     setStartSuggestions([]);
-    setGeoStatus(language === "en" ? `Start set: ${label}` : `已设置起点：${label}`);
+    setStartSearchStatus(language === "en" ? `Start set: ${label}` : `已设置起点：${label}`);
   };
 
   const applyPreferencePreset = (value: string) => {
@@ -698,13 +828,13 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
     const chips = [];
     if (cityName.trim()) chips.push(language === "en" ? "City√" : "城市√");
     if (selectedDistricts.length) chips.push(language === "en" ? "District√" : "区县√");
-    if (startPoint.trim() || oneShotLocation) chips.push(language === "en" ? "Start√" : "起点√");
+    if (startPoint.trim()) chips.push(language === "en" ? "Start√" : "起点√");
     if (startDate && endDate && startTime && endTime) chips.push(language === "en" ? "Time√" : "时间√");
     if (budgetAmount) chips.push(language === "en" ? "Budget√" : "预算√");
     if (peopleAmount) chips.push(language === "en" ? "People√" : "人数√");
     if (input.trim()) chips.push(language === "en" ? "Preference√" : "偏好√");
     return chips;
-  }, [budgetAmount, cityName, endDate, endTime, input, language, oneShotLocation, peopleAmount, selectedDistricts.length, startDate, startPoint, startTime]);
+  }, [budgetAmount, cityName, endDate, endTime, input, language, peopleAmount, selectedDistricts.length, startDate, startPoint, startTime]);
   const completionPct = Math.min(100, Math.round((detectedFields.length / 7) * 100));
 
   const startComposerResize = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -865,11 +995,11 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
         <div
           onMouseDown={startComposerResize}
           className="absolute left-0 right-0 top-0 h-3 cursor-ns-resize"
-          aria-label="拖拽调整输入面板高度"
+          aria-label={language === "en" ? "Drag to resize input panel" : "拖拽调整输入面板高度"}
         />
         <div
           className="mx-auto flex w-full max-w-7xl flex-col rounded-lg border border-slate-200 bg-white p-4 shadow-sm focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-100"
-          style={{ height: composerHeight }}
+          style={{ minHeight: composerHeight }}
         >
           <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
             <div>
@@ -887,7 +1017,7 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
                   <span key={chip} className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
                     {chip}
                   </span>
-                )) : <span className="text-xs text-slate-500">{geoStatus}</span>}
+                )) : <span className="text-xs text-slate-500">{text.startManualHint}</span>}
               </div>
             </div>
             <span className="text-xs text-slate-400">{text.enterHint}</span>
@@ -921,24 +1051,17 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
             </label>
             <label className="relative text-xs font-medium text-slate-500">
               {text.startPoint}
-              <div className="mt-1 flex gap-2">
+              <div className="mt-1">
                 <input
                   value={startPoint}
                   onChange={(e) => handleStartPointChange(e.target.value)}
                   placeholder={text.startPointPlaceholder}
                   className="h-9 w-full rounded-lg border border-slate-200 px-3 text-sm text-slate-900 outline-none focus:border-blue-400"
                 />
-                <button
-                  type="button"
-                  onClick={requestCurrentLocation}
-                  className="h-9 shrink-0 rounded-lg border border-blue-200 bg-blue-50 px-3 text-xs font-medium text-blue-700 transition hover:border-blue-300 hover:bg-blue-100"
-                >
-                  {text.myLocation}
-                </button>
               </div>
-              <div className="mt-1 truncate text-[11px] text-slate-400">{startSearchStatus || geoStatus}</div>
+              <div className="mt-1 truncate text-[11px] text-slate-400">{startSearchStatus || text.startManualHint}</div>
               {startSuggestions.length > 0 && (
-                <div className="absolute left-0 right-0 top-[82px] z-30 overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
+                <div className="absolute left-0 top-[82px] z-30 max-h-72 w-[520px] max-w-[calc(100vw-2rem)] overflow-y-auto overflow-x-hidden rounded-lg border border-slate-200 bg-white shadow-xl">
                   {startSuggestions.map((item) => {
                     const label = formatSuggestionTitle(item, language);
                     const sub = formatSuggestionSub(item);
@@ -987,7 +1110,7 @@ export default function Chat({ sessionId, onItinerary, onReady, language }: Chat
             </div>
           </div>
 
-          <div className="mt-3 min-h-0 flex-1 overflow-y-auto">
+          <div className="mt-3">
             {districtOptions.length > 0 && (
               <div className="mb-3">
                 <div className="mb-1 text-xs font-medium text-slate-500">{text.districts}</div>

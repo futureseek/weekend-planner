@@ -1,8 +1,11 @@
 import json
 import math
+import re
 from itertools import permutations
 from db.database import execute_one, execute_write
 
+FOOD_CATEGORIES = {"餐厅", "咖啡", "甜品"}
+ACTIVITY_CATEGORIES = {"景点", "展览", "公园", "购物", "娱乐", "夜景"}
 
 CATEGORY_DEFAULT_COST = {
     "咖啡": 40,
@@ -87,11 +90,44 @@ def _safe_tags(poi: dict) -> list[str]:
     return tags if isinstance(tags, list) else []
 
 
+def _poi_text(poi: dict) -> str:
+    return " ".join([
+        str(poi.get("name") or ""),
+        str(poi.get("category") or ""),
+        str(poi.get("type") or ""),
+        str(poi.get("address") or ""),
+        *map(str, _safe_tags(poi)),
+    ])
+
+
+def _is_unavailable_poi(poi: dict) -> bool:
+    text = _poi_text(poi)
+    return any(
+        keyword in text
+        for keyword in ["不对外开放", "暂不开放", "暂停开放", "未开放", "内部使用", "内部区域", "非开放区域", "谢绝参观"]
+    )
+
+
 def _to_float(value, default: float = 0.0) -> float:
     try:
         return float(value or default)
     except (TypeError, ValueError):
         return default
+
+
+def _budget_limit(constraints: dict | None) -> float | None:
+    budget = _to_float((constraints or {}).get("budget"), 0)
+    return budget if budget > 0 else None
+
+
+def _route_total_cost(route: list[dict], constraints: dict) -> float:
+    people_count = max(1, int((constraints or {}).get("people_count") or 1))
+    return sum(_effective_unit_cost(poi) * people_count for poi in route)
+
+
+def _within_budget(route: list[dict], constraints: dict) -> bool:
+    budget_limit = _budget_limit(constraints)
+    return budget_limit is None or _route_total_cost(route, constraints) <= budget_limit
 
 
 def _effective_unit_cost(poi: dict) -> float:
@@ -233,7 +269,16 @@ def score_poi(poi: dict, constraints: dict, user_profile: dict = None, area_cent
         hot_score += 0.12
     guide_positive = constraints.get("guide_positive_keywords") or []
     guide_avoid = constraints.get("guide_avoid_keywords") or []
+    guide_hot_places = constraints.get("guide_hot_places") or []
     review_text = str(review.get("content", "") or "")
+    if any(
+        place and (
+            str(place) in poi_text
+            or str(poi.get("name") or "") in str(place)
+        )
+        for place in guide_hot_places[:16]
+    ):
+        hot_score += 0.24
     if any(keyword in poi_text or keyword in review_text for keyword in guide_positive):
         hot_score += 0.18
     if any(keyword in poi_text or keyword in review.get("content", "") for keyword in guide_avoid):
@@ -308,6 +353,14 @@ def build_route_matrix(pois: list[dict], mode: str = "walking") -> dict:
 
 
 def _visit_duration_s(poi: dict) -> int:
+    text = _poi_text(poi)
+    category = poi.get("category", "")
+    if any(keyword in text for keyword in ["商圈", "步行街", "商业街", "购物中心", "太古汇", "万象城", "K11", "天河城", "正佳", "北京路", "上下九", "市桥"]):
+        return 120 * 60
+    if any(keyword in text for keyword in ["广场", "古镇", "老街", "景区"]):
+        return 95 * 60
+    if category == "购物":
+        return 105 * 60
     return {
         "咖啡": 35,
         "餐厅": 65,
@@ -326,6 +379,7 @@ def calculate_route_score(route: list[dict], matrix: dict, constraints: dict) ->
     total_distance = 0
     total_duration = 0
     total_cost = 0
+    transfer_penalty = 0.0
     people_count = max(1, int(constraints.get("people_count") or 1))
 
     categories = set()
@@ -338,8 +392,17 @@ def calculate_route_score(route: list[dict], matrix: dict, constraints: dict) ->
         if i > 0:
             key = (route[i - 1]["id"], poi["id"])
             if key in matrix:
-                total_distance += matrix[key]["distance_m"]
-                total_duration += matrix[key]["duration_s"]
+                leg_distance = matrix[key]["distance_m"]
+                leg_duration = matrix[key]["duration_s"]
+                total_distance += leg_distance
+                total_duration += leg_duration
+                leg_minutes = leg_duration / 60
+                if leg_minutes > 20:
+                    transfer_penalty += (leg_minutes - 20) * 0.035
+                if leg_distance > 1600:
+                    transfer_penalty += ((leg_distance - 1600) / 1000) * 0.28
+                if leg_distance > 5000:
+                    transfer_penalty += ((leg_distance - 5000) / 1000) * 0.45
 
     dist_boost = constraints.get("distance_weight_boost", 1.0)
     diversity_bonus = min(len(categories), 5) * 0.12
@@ -352,12 +415,14 @@ def calculate_route_score(route: list[dict], matrix: dict, constraints: dict) ->
         + preference_bonus
         - 0.00000035 * (total_distance ** 2) * dist_boost
         - 0.007 * (total_duration / 60)
+        - transfer_penalty * dist_boost
     )
 
     budget = constraints.get("budget")
+    budget_limit = _budget_limit(constraints)
     if budget:
-        if total_cost > budget:
-            route_score -= (total_cost - budget) * 0.08
+        if budget_limit and total_cost > budget_limit:
+            route_score -= 20 + (total_cost - budget_limit) * 0.2
         else:
             utilization = total_cost / budget
             target_ratio = float(constraints.get("budget_target_ratio") or 0.78)
@@ -386,6 +451,10 @@ def optimize_route(
     if not pois:
         return {"plans": [], "matrix": {}}
 
+    pois = [poi for poi in pois if not _is_unavailable_poi(poi)]
+    if not pois:
+        return {"plans": [], "matrix": {}}
+
     center = _parse_center(area_center)
     pois = _filter_by_trip_radius(pois, constraints, center)
     for poi in pois:
@@ -397,12 +466,14 @@ def optimize_route(
 
     duration_limit = constraints.get("duration_minutes")
     if duration_limit and duration_limit <= 360:
-        hard_limit = 14
+        hard_limit = 12
     elif max_stops <= 6:
-        hard_limit = 11
+        hard_limit = 14
     else:
-        hard_limit = 9
-    candidates = _bucket_and_select(pois, max_stops=max_stops, hard_limit=hard_limit)
+        hard_limit = 14
+    if constraints.get("_fast_adjust"):
+        hard_limit = min(hard_limit, max(max_stops + 3, 9))
+    candidates = _bucket_and_select(pois, max_stops=max_stops, hard_limit=hard_limit, constraints=constraints)
     matrix = build_route_matrix(candidates, constraints.get("transport_mode", "walking"))
     route_len = min(len(candidates), max_stops)
     if duration_limit:
@@ -411,7 +482,9 @@ def optimize_route(
         return {"plans": [], "matrix": matrix}
 
     all_routes = []
-    for perm in permutations(candidates, route_len):
+    exact_limit = route_len if constraints.get("_fast_adjust") else (8 if route_len >= 5 else 9)
+    search_candidates = candidates[: min(len(candidates), max(route_len, exact_limit))]
+    for perm in permutations(search_candidates, route_len):
         route = list(perm)
         score_info = calculate_route_score(route, matrix, constraints)
         all_routes.append({"route": route, "score_info": score_info})
@@ -428,28 +501,51 @@ def optimize_route(
             all_routes = sorted(all_routes, key=lambda r: r["score_info"]["total_duration_s"])[: max(80, len(all_routes) // 5)]
 
     budget = constraints.get("budget")
-    if budget:
-        budget_fit = [r for r in all_routes if r["score_info"]["total_cost"] <= budget]
+    budget_limit = _budget_limit(constraints)
+    if budget_limit:
+        budget_fit = [r for r in all_routes if r["score_info"]["total_cost"] <= budget_limit]
         if budget_fit:
             all_routes = budget_fit
 
     results = []
 
     def add_plan(name: str, style: str, route_item: dict, highlights: list[str], allow_similar: bool = False):
+        required_stops = min(_min_single_day_stops(constraints), len(_dedupe_route(candidates)))
         display_route = _order_route_for_day_flow(route_item["route"], matrix)
         display_route = _repair_route_composition(display_route, candidates, constraints, style)
         display_route = _trim_route_to_budget(display_route, constraints)
-        display_route = _fill_single_day_density(display_route, candidates, constraints, _min_single_day_stops(constraints), style)
+        display_route = _fill_single_day_density(display_route, candidates, constraints, required_stops, style)
         display_route = _order_route_for_day_flow(display_route, matrix)
-        if _is_same_order(display_route, [r["route"] for r in results]):
-            display_route = _make_route_distinct(display_route, candidates, [r["route"] for r in results], style)
-            display_route = _fill_single_day_density(display_route, candidates, constraints, _min_single_day_stops(constraints), style)
+        display_route = _repair_route_composition(display_route, candidates, constraints, style)
+        display_route = _trim_route_to_budget(display_route, constraints)
+        display_route = _fill_single_day_density(display_route, candidates, constraints, required_stops, style)
+        display_route = _order_route_for_day_flow(display_route, matrix)
+        display_route = _repair_route_composition(display_route, candidates, constraints, style)
+        display_route = _fill_single_day_density(display_route, candidates, constraints, required_stops, style)
+        existing_routes = [r["route"] for r in results]
+        if _is_same_order(display_route, existing_routes) or _is_same_stop_set(display_route, existing_routes):
+            display_route = _make_route_distinct(display_route, candidates, existing_routes, style)
+            display_route = _fill_single_day_density(display_route, candidates, constraints, required_stops, style)
+            display_route = _repair_route_composition(_order_route_for_day_flow(display_route, matrix), candidates, constraints, style)
+            display_route = _trim_route_to_budget(display_route, constraints)
+            display_route = _fill_single_day_density(display_route, candidates, constraints, required_stops, style)
+        display_route = _repair_route_composition(_order_route_for_day_flow(display_route, matrix), candidates, constraints, style)
+        display_route = _fill_single_day_density(display_route, candidates, constraints, required_stops, style)
+        display_route = _trim_route_to_budget(_order_route_for_day_flow(display_route, matrix), constraints)
+        if not _is_usable_single_day_route(display_route, required_stops):
+            display_route = _make_route_distinct(display_route, candidates, existing_routes, style)
+            display_route = _repair_route_composition(_order_route_for_day_flow(display_route, matrix), candidates, constraints, style)
+            display_route = _fill_single_day_density(display_route, candidates, constraints, required_stops, style)
+            display_route = _trim_route_to_budget(_order_route_for_day_flow(display_route, matrix), constraints)
+        if not _is_usable_single_day_route(display_route, required_stops):
+            return
         display_score = calculate_route_score(display_route, matrix, constraints)
-        if constraints.get("budget") and display_score.get("total_cost", 0) > constraints["budget"]:
+        if not _within_budget(display_route, constraints):
             return
-        if _is_same_order(display_route, [r["route"] for r in results]):
+        existing_routes = [r["route"] for r in results]
+        if _is_same_order(display_route, existing_routes) or _is_same_stop_set(display_route, existing_routes):
             return
-        if not allow_similar and _is_too_similar(display_route, [r["route"] for r in results]):
+        if not allow_similar and _is_too_similar(display_route, existing_routes):
             return
         results.append({
             "name": name,
@@ -482,7 +578,7 @@ def optimize_route(
         all_routes,
         key=lambda x: (x["score_info"]["total_distance_m"], -x["score_info"]["route_score"]),
     )
-    add_plan("少走路", "short_walk", walking, ["地点更集中", "步行距离更短"], allow_similar=True)
+    add_plan("少走路", "short_walk", walking, ["地点更集中", "步行距离更短"])
 
     food_fun = _route_item_from_direct_selection(
         _direct_style_route(candidates, route_len, "food_fun", constraints),
@@ -496,7 +592,7 @@ def optimize_route(
             -x["score_info"]["total_distance_m"],
         ),
     )
-    add_plan("吃好玩好", "food_fun", food_fun, ["餐饮和消费体验更完整", "适合逛吃"], allow_similar=True)
+    add_plan("吃好玩好", "food_fun", food_fun, ["餐饮和消费体验更完整", "适合逛吃"])
 
     if constraints.get("budget_level") in {"comfort", "premium"}:
         premium = _route_item_from_direct_selection(
@@ -511,7 +607,7 @@ def optimize_route(
                 x["score_info"]["total_poi_score"],
             ),
         )
-        add_plan("预算充分", "premium", premium, ["提高预算利用", "升级餐饮和体验"], allow_similar=True)
+        add_plan("预算充分", "premium", premium, ["提高预算利用", "升级餐饮和体验"])
 
     low_budget = _route_item_from_direct_selection(
         _direct_style_route(candidates, route_len, "budget", constraints),
@@ -521,7 +617,7 @@ def optimize_route(
         all_routes,
         key=lambda x: (x["score_info"]["total_cost"], x["score_info"]["total_distance_m"], -x["score_info"]["route_score"]),
     )
-    add_plan("省钱轻量", "budget", low_budget, ["低消费", "保留核心体验"], allow_similar=True)
+    add_plan("省钱轻量", "budget", low_budget, ["低消费", "保留核心体验"])
 
     # 如果风格方案因相似度被过滤，补充差异最大的高分路线。
     sorted_routes = sorted(all_routes, key=lambda x: x["score_info"]["route_score"], reverse=True)
@@ -530,10 +626,32 @@ def optimize_route(
             break
         add_plan(f"备选方案{len(results) + 1}", "alternative", item, ["补充选择"])
 
+    if len(results) < 3 and candidates:
+        supplemental_specs = [
+            ("兴趣强化", "food_fun", ["强化偏好", "增加体验点"]),
+            ("轻松探索", "short_walk", ["少折返", "节奏更轻"]),
+            ("预算稳妥", "budget", ["控制花费", "保留核心体验"]),
+            ("备选方案", "alternative", ["补充选择"]),
+        ]
+        for offset in range(len(candidates)):
+            if len(results) >= 3:
+                break
+            rotated_candidates = candidates[offset:] + candidates[:offset]
+            for base_name, style, highlights in supplemental_specs:
+                if len(results) >= 3:
+                    break
+                route = _direct_style_route(rotated_candidates, route_len, style, constraints)
+                route = _make_route_distinct(route, candidates, [item["route"] for item in results], style)
+                route_item = _route_item_from_direct_selection(route, matrix, constraints)
+                if not route_item:
+                    continue
+                name = base_name if base_name not in {item["name"] for item in results} else f"{base_name}{len(results) + 1}"
+                add_plan(name, style, route_item, highlights, allow_similar=True)
+
     if not results and budget:
         cheapest = min(all_routes, key=lambda x: (x["score_info"]["total_cost"], x["score_info"]["total_distance_m"]))
         display_route = _trim_route_to_budget(_order_route_for_day_flow(cheapest["route"], matrix), constraints)
-        if len(display_route) >= 2:
+        if len(display_route) >= 2 and _within_budget(display_route, constraints):
             results.append({
                 "name": "综合推荐",
                 "style": "balanced",
@@ -552,11 +670,11 @@ def _route_item_from_direct_selection(route: list[dict], matrix: dict, constrain
 
 
 def _trim_route_to_budget(route: list[dict], constraints: dict) -> list[dict]:
-    budget = constraints.get("budget")
-    if not budget:
+    budget_limit = _budget_limit(constraints)
+    if not budget_limit:
         return route
     people_count = max(1, int(constraints.get("people_count") or 1))
-    per_person_day_budget = budget / max(1, people_count) / max(1, int(constraints.get("trip_days") or 1))
+    per_person_day_budget = budget_limit / max(1, people_count) / max(1, int(constraints.get("trip_days") or 1))
     if per_person_day_budget <= 90:
         min_stops = 3
     elif per_person_day_budget <= 160:
@@ -568,7 +686,7 @@ def _trim_route_to_budget(route: list[dict], constraints: dict) -> list[dict]:
     def total_cost(items: list[dict]) -> float:
         return sum(_effective_unit_cost(poi) * people_count for poi in items)
 
-    while total_cost(trimmed) > budget and len(trimmed) > min_stops:
+    def remove_costliest() -> None:
         removable = max(
             trimmed,
             key=lambda p: (
@@ -578,9 +696,11 @@ def _trim_route_to_budget(route: list[dict], constraints: dict) -> list[dict]:
             ),
         )
         trimmed.remove(removable)
-    while total_cost(trimmed) > budget and len(trimmed) > 3:
-        removable = max(trimmed, key=lambda p: (_effective_unit_cost(p) * people_count, -p.get("_score", 0)))
-        trimmed.remove(removable)
+
+    while total_cost(trimmed) > budget_limit and len(trimmed) > min_stops:
+        remove_costliest()
+    while total_cost(trimmed) > budget_limit and len(trimmed) > 2:
+        remove_costliest()
     return trimmed
 
 
@@ -588,9 +708,9 @@ def _min_single_day_stops(constraints: dict) -> int:
     duration = int(constraints.get("duration_minutes") or 0)
     if duration >= 480:
         return 6
-    if duration >= 300:
+    if duration >= 240:
         return 4
-    return 3
+    return 4 if not duration else 3
 
 
 def _fill_single_day_density(
@@ -604,12 +724,12 @@ def _fill_single_day_density(
     if len(selected) >= min_stops:
         return selected
 
-    budget = constraints.get("budget")
+    budget_limit = _budget_limit(constraints)
     people_count = max(1, int(constraints.get("people_count") or 1))
     selected_ids = {p.get("id") for p in selected}
     selected_names = {_normalize_route_name(p.get("name", "")) for p in selected}
-    food_categories = {"餐厅", "咖啡", "甜品"}
-    activity_categories = {"景点", "展览", "公园", "购物", "娱乐", "夜景"}
+    food_categories = FOOD_CATEGORIES
+    activity_categories = ACTIVITY_CATEGORIES
     prefs = set(constraints.get("preferences") or [])
 
     def total_cost(items: list[dict]) -> float:
@@ -617,6 +737,9 @@ def _fill_single_day_density(
 
     def food_count(items: list[dict]) -> int:
         return sum(1 for p in items if p.get("category") in food_categories)
+
+    def restaurant_count(items: list[dict]) -> int:
+        return sum(1 for p in items if p.get("category") == "餐厅")
 
     def preference_rank(poi: dict) -> int:
         category = poi.get("category")
@@ -642,10 +765,14 @@ def _fill_single_day_density(
     for poi in remaining:
         if len(selected) >= min_stops:
             break
-        if poi.get("category") in food_categories and food_count(selected) >= (2 if min_stops >= 5 else 1):
+        if _route_family_key(poi) in {_route_family_key(item) for item in selected}:
+            continue
+        if poi.get("category") == "餐厅" and restaurant_count(selected) >= 1:
+            continue
+        if poi.get("category") in food_categories and food_count(selected) >= 2:
             continue
         poi_cost = _effective_unit_cost(poi) * people_count
-        if budget and current_cost + poi_cost > budget:
+        if budget_limit and current_cost + poi_cost > budget_limit:
             continue
         selected.append(poi)
         selected_ids.add(poi.get("id"))
@@ -658,8 +785,14 @@ def _fill_single_day_density(
                 break
             if poi.get("id") in selected_ids or _normalize_route_name(poi.get("name", "")) in selected_names:
                 continue
+            if _route_family_key(poi) in {_route_family_key(item) for item in selected}:
+                continue
+            if poi.get("category") == "餐厅" and restaurant_count(selected) >= 1:
+                continue
+            if poi.get("category") in food_categories and food_count(selected) >= 2:
+                continue
             poi_cost = _effective_unit_cost(poi) * people_count
-            if budget and current_cost + poi_cost > budget:
+            if budget_limit and current_cost + poi_cost > budget_limit:
                 continue
             selected.append(poi)
             selected_ids.add(poi.get("id"))
@@ -675,12 +808,18 @@ def _repair_route_composition(route: list[dict], candidates: list[dict], constra
         return route
 
     prefs = set(constraints.get("preferences") or [])
-    food_categories = {"餐厅", "咖啡", "甜品"}
-    activity_categories = {"景点", "展览", "公园", "购物", "娱乐", "夜景"}
+    food_categories = FOOD_CATEGORIES
+    activity_categories = ACTIVITY_CATEGORIES
     selected_ids = {poi["id"] for poi in route}
+    selected_families = {_route_family_key(poi) for poi in route}
 
     def best_from(categories: set[str], prefer_cost: bool = False) -> dict | None:
-        pool = [p for p in candidates if p["id"] not in selected_ids and p.get("category") in categories]
+        pool = [
+            p for p in candidates
+            if p["id"] not in selected_ids
+            and _route_family_key(p) not in selected_families
+            and p.get("category") in categories
+        ]
         if not pool:
             return None
         if prefer_cost or style == "premium":
@@ -700,8 +839,10 @@ def _repair_route_composition(route: list[dict], candidates: list[dict], constra
             replaceable = list(enumerate(route))
         idx, old = min(replaceable, key=lambda item: (item[1].get("_score", 0), _effective_unit_cost(item[1])))
         selected_ids.discard(old["id"])
+        selected_families.discard(_route_family_key(old))
         route[idx] = replacement
         selected_ids.add(replacement["id"])
+        selected_families.add(_route_family_key(replacement))
 
     needs_meal = "美食" in prefs or (constraints.get("duration_minutes") or 0) >= 360 or style in {"food_fun", "premium"}
     if needs_meal and not any(p.get("category") == "餐厅" for p in route):
@@ -709,21 +850,27 @@ def _repair_route_composition(route: list[dict], candidates: list[dict], constra
         if restaurant:
             replace_one(restaurant, avoid_categories={"景点", "展览", "公园", "夜景", "娱乐"})
 
-    if (prefs & {"夜景", "热闹", "娱乐"} or style in {"food_fun", "premium"}) and not any(
+    if (prefs & {"夜景", "热闹", "娱乐", "游戏"} or style in {"food_fun", "premium"}) and not any(
         p.get("category") in {"夜景", "娱乐"} for p in route
     ):
         night_or_fun = best_from({"夜景", "娱乐"}, prefer_cost=style == "premium")
         if night_or_fun:
             replace_one(night_or_fun, avoid_categories={"餐厅", "景点", "展览"})
 
-    max_food = 3 if len(route) >= 6 else 2
+    if "游戏" in prefs and not any(p.get("category") == "娱乐" for p in route):
+        game_stop = best_from({"娱乐"}, prefer_cost=style in {"food_fun", "premium"})
+        if game_stop:
+            replace_one(game_stop, avoid_categories={"餐厅"})
+
+    max_food = 2
     while sum(1 for p in route if p.get("category") in food_categories) > max_food:
         replacement = best_from(activity_categories, prefer_cost=style == "premium")
         if not replacement:
-            if len(route) > max(3, max_food):
-                food_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") in food_categories]
+            food_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") in food_categories]
+            if len(food_items) > max_food:
                 idx, old = min(food_items, key=lambda item: item[1].get("_score", 0))
                 selected_ids.discard(old["id"])
+                selected_families.discard(_route_family_key(old))
                 route.pop(idx)
                 continue
             break
@@ -732,25 +879,55 @@ def _repair_route_composition(route: list[dict], candidates: list[dict], constra
             food_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") in food_categories]
         idx, old = min(food_items, key=lambda item: item[1].get("_score", 0))
         selected_ids.discard(old["id"])
+        selected_families.discard(_route_family_key(old))
         route[idx] = replacement
         selected_ids.add(replacement["id"])
+        selected_families.add(_route_family_key(replacement))
 
-    max_restaurants = 2 if len(route) >= 7 else 1
+    max_restaurants = 1
     while sum(1 for p in route if p.get("category") == "餐厅") > max_restaurants:
         replacement = best_from(activity_categories, prefer_cost=style == "premium")
         if not replacement:
-            if len(route) > max(3, max_restaurants + 2):
-                restaurant_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") == "餐厅"]
+            restaurant_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") == "餐厅"]
+            if len(restaurant_items) > max_restaurants:
                 idx, old = min(restaurant_items, key=lambda item: item[1].get("_score", 0))
                 selected_ids.discard(old["id"])
+                selected_families.discard(_route_family_key(old))
                 route.pop(idx)
                 continue
             break
         restaurant_items = [(idx, poi) for idx, poi in enumerate(route) if poi.get("category") == "餐厅"]
         idx, old = min(restaurant_items, key=lambda item: item[1].get("_score", 0))
         selected_ids.discard(old["id"])
+        selected_families.discard(_route_family_key(old))
         route[idx] = replacement
         selected_ids.add(replacement["id"])
+        selected_families.add(_route_family_key(replacement))
+
+    min_activity = 2 if len(route) >= 4 else 1
+    if prefs & {"游戏", "娱乐", "夜景", "热闹"}:
+        min_activity = min(3, max(min_activity, 2))
+    while sum(1 for p in route if p.get("category") in activity_categories) < min_activity:
+        replacement = best_from(activity_categories, prefer_cost=style == "premium")
+        if not replacement:
+            break
+        replaceable = [
+            (idx, poi)
+            for idx, poi in enumerate(route)
+            if poi.get("category") in food_categories
+        ] or [
+            (idx, poi)
+            for idx, poi in enumerate(route)
+            if poi.get("category") not in activity_categories
+        ]
+        if not replaceable:
+            break
+        idx, old = min(replaceable, key=lambda item: item[1].get("_score", 0))
+        selected_ids.discard(old["id"])
+        selected_families.discard(_route_family_key(old))
+        route[idx] = replacement
+        selected_ids.add(replacement["id"])
+        selected_families.add(_route_family_key(replacement))
 
     return _dedupe_route(route)
 
@@ -772,7 +949,7 @@ def _make_route_distinct(route: list[dict], candidates: list[dict], existing_rou
             candidate_route = list(route)
             candidate_route[idx] = replacement
             candidate_route = _order_route_for_day_flow(_dedupe_route(candidate_route), {})
-            if not _is_same_order(candidate_route, existing_routes):
+            if not _is_same_order(candidate_route, existing_routes) and not _is_same_stop_set(candidate_route, existing_routes):
                 return candidate_route
     return route
 
@@ -826,9 +1003,15 @@ def _direct_style_route(candidates: list[dict], target_len: int, style: str, con
 
     selected: list[dict] = []
     seen: set[str] = set()
+    seen_families: set[str] = set()
 
     def add_from(category: str, count: int = 1, reverse_cost: bool = False):
-        bucket = [p for p in candidates if p.get("category") == category and p["id"] not in seen]
+        bucket = [
+            p for p in candidates
+            if p.get("category") == category
+            and p["id"] not in seen
+            and _route_family_key(p) not in seen_families
+        ]
         if style == "budget":
             bucket.sort(key=lambda p: (_effective_unit_cost(p), -p.get("_score", 0)))
         elif reverse_cost:
@@ -840,6 +1023,7 @@ def _direct_style_route(candidates: list[dict], target_len: int, style: str, con
                 return
             selected.append(poi)
             seen.add(poi["id"])
+            seen_families.add(_route_family_key(poi))
 
     prefs = set((constraints or {}).get("preferences") or [])
     recipe = next((PREFERENCE_STYLE_RECIPES[pref] for pref in PREFERENCE_STYLE_RECIPES if pref in prefs), None)
@@ -851,12 +1035,10 @@ def _direct_style_route(candidates: list[dict], target_len: int, style: str, con
                 adjusted_count = 1
             add_from(category, adjusted_count, reverse_cost=style in {"food_fun", "premium"} and category in {"餐厅", "购物", "娱乐", "夜景"})
     elif style == "food_fun":
-        meal_count = 2 if target_len >= 7 else 1
-        for category, count in [("餐厅", meal_count), ("甜品", 1), ("咖啡", 1), ("购物", 1), ("娱乐", 1), ("夜景", 1), ("景点", 1), ("展览", 1)]:
+        for category, count in [("餐厅", 1), ("娱乐", 1), ("夜景", 1), ("购物", 1), ("咖啡", 1), ("景点", 1), ("展览", 1), ("甜品", 1)]:
             add_from(category, count, reverse_cost=category in {"餐厅", "购物", "娱乐"})
     elif style == "premium":
-        meal_count = 2 if target_len >= 7 else 1
-        for category, count in [("景点", 1), ("展览", 1), ("餐厅", meal_count), ("购物", 1), ("娱乐", 1), ("夜景", 1), ("咖啡", 1), ("甜品", 1), ("公园", 1)]:
+        for category, count in [("景点", 1), ("展览", 1), ("餐厅", 1), ("购物", 1), ("娱乐", 1), ("夜景", 1), ("咖啡", 1), ("公园", 1), ("甜品", 1)]:
             add_from(category, count, reverse_cost=category in {"餐厅", "购物", "娱乐", "夜景"})
     elif style == "budget":
         for category in ["公园", "展览", "景点", "咖啡", "甜品", "餐厅", "购物", "娱乐", "夜景"]:
@@ -864,13 +1046,33 @@ def _direct_style_route(candidates: list[dict], target_len: int, style: str, con
     elif style == "short_walk":
         ordered = _order_route_nearest(candidates, build_route_matrix(candidates[: min(len(candidates), 10)]))
         for poi in ordered:
-            if poi["id"] not in seen and len(selected) < target_len:
+            family_key = _route_family_key(poi)
+            if poi["id"] not in seen and family_key not in seen_families and len(selected) < target_len:
                 selected.append(poi)
                 seen.add(poi["id"])
+                seen_families.add(family_key)
 
     remaining = [p for p in candidates if p["id"] not in seen]
     remaining.sort(key=lambda p: p.get("_score", 0), reverse=True)
-    selected.extend(remaining[: max(0, target_len - len(selected))])
+    food_categories = {"餐厅", "咖啡", "甜品"}
+
+    def can_append(poi: dict) -> bool:
+        if _route_family_key(poi) in seen_families:
+            return False
+        if poi.get("category") == "餐厅" and any(item.get("category") == "餐厅" for item in selected):
+            return False
+        if poi.get("category") in food_categories and sum(1 for item in selected if item.get("category") in food_categories) >= 2:
+            return False
+        return True
+
+    for poi in remaining:
+        if len(selected) >= target_len:
+            break
+        if not can_append(poi):
+            continue
+        selected.append(poi)
+        seen.add(poi["id"])
+        seen_families.add(_route_family_key(poi))
     return selected[:target_len]
 
 
@@ -920,7 +1122,9 @@ def _optimize_multiday_route(pois: list[dict], constraints: dict, trip_days: int
                 ordered = _rotate_route_order(ordered, len(results) + 1)
             if len(ordered) < 3 or _is_same_order(ordered, [r["route"] for r in results]):
                 continue
-            score_info = calculate_route_score(ordered, matrix, constraints)
+        score_info = calculate_route_score(ordered, matrix, constraints)
+        if not _within_budget(ordered, constraints):
+            continue
         results.append({
             "name": name,
             "style": style,
@@ -931,17 +1135,19 @@ def _optimize_multiday_route(pois: list[dict], constraints: dict, trip_days: int
 
     if not results:
         ordered = _order_multiday_route(candidates[:target_stops], matrix, trip_days, start_center)
-        results.append({
-            "name": "多日综合",
-            "style": "balanced",
-            "route": _clean_route(ordered),
-            "score": calculate_route_score(ordered, matrix, constraints),
-            "highlights": ["按天拆分"],
-        })
+        if _within_budget(ordered, constraints):
+            results.append({
+                "name": "多日综合",
+                "style": "balanced",
+                "route": _clean_route(ordered),
+                "score": calculate_route_score(ordered, matrix, constraints),
+                "highlights": ["按天拆分"],
+            })
 
     budget = constraints.get("budget")
-    if budget:
-        feasible = [r for r in results if r["score"].get("total_cost", 0) <= budget]
+    budget_limit = _budget_limit(constraints)
+    if budget_limit:
+        feasible = [r for r in results if r["score"].get("total_cost", 0) <= budget_limit]
         target_ratio = float(constraints.get("budget_target_ratio") or 0.82)
         if feasible:
             sorted_feasible = sorted(
@@ -952,10 +1158,10 @@ def _optimize_multiday_route(pois: list[dict], constraints: dict, trip_days: int
                     -r["score"].get("route_score", 0),
                 ),
             )
-            supplemental = [r for r in results if r not in sorted_feasible and r["score"].get("total_cost", 0) <= budget]
+            supplemental = [r for r in results if r not in sorted_feasible and r["score"].get("total_cost", 0) <= budget_limit]
             results = sorted_feasible + supplemental
         else:
-            results = sorted(results, key=lambda r: (r["score"].get("total_cost", 0), -len(r["route"])))
+            results = []
 
     if len(results) < 4 and candidates:
         fallback_specs = [
@@ -974,6 +1180,8 @@ def _optimize_multiday_route(pois: list[dict], constraints: dict, trip_days: int
             if len(ordered) >= 3 and _is_same_order(ordered, [r["route"] for r in results]):
                 ordered = _rotate_route_order(ordered, len(results) + 1)
             if len(ordered) < 3 or _is_same_order(ordered, [r["route"] for r in results]):
+                continue
+            if not _within_budget(ordered, constraints):
                 continue
             results.append({
                 "name": name if name not in {r["name"] for r in results} else f"{name}{len(results) + 1}",
@@ -1004,8 +1212,8 @@ def _filter_by_trip_radius(pois: list[dict], constraints: dict, center: tuple[fl
 
 
 def _fill_route_to_budget(route: list[dict], candidates: list[dict], constraints: dict, target_stops: int) -> list[dict]:
-    budget = constraints.get("budget")
-    if not budget or len(route) >= target_stops:
+    budget_limit = _budget_limit(constraints)
+    if not budget_limit or len(route) >= target_stops:
         return route
 
     people_count = max(1, int(constraints.get("people_count") or 1))
@@ -1020,10 +1228,10 @@ def _fill_route_to_budget(route: list[dict], candidates: list[dict], constraints
         return sum(1 for p in items if p.get("category") in food_categories)
 
     current_cost = route_cost(selected)
-    budget_cap = budget
+    budget_cap = budget_limit
     selected_names = {_normalize_route_name(p.get("name", "")) for p in selected}
     selected_ids = {p.get("id") for p in selected}
-    food_limit = max(3, int(target_stops * 0.36))
+    food_limit = 2
 
     remaining = [
         p for p in candidates
@@ -1114,10 +1322,10 @@ def _select_candidates_by_style(candidates: list[dict], constraints: dict, targe
             "premium": [
                 ["景点", "展览", "公园"],
                 ["餐厅"],
-                ["购物", "娱乐", "景点"],
-                ["咖啡", "甜品"],
+                ["娱乐", "购物", "景点"],
+                ["夜景", "咖啡", "甜品"],
                 ["展览", "公园", "购物"],
-                ["餐厅", "夜景", "娱乐"],
+                ["夜景", "娱乐", "购物"],
             ],
             "light": [
                 ["公园", "景点"],
@@ -1129,10 +1337,10 @@ def _select_candidates_by_style(candidates: list[dict], constraints: dict, targe
         }.get(style, [
             ["景点", "展览", "公园"],
             ["餐厅"],
-            ["购物", "娱乐", "景点"],
-            ["咖啡", "甜品"],
+            ["娱乐", "购物", "景点"],
+            ["夜景", "咖啡", "甜品"],
             ["展览", "公园", "夜景"],
-            ["餐厅", "夜景", "娱乐"],
+            ["夜景", "娱乐", "购物"],
         ])
         while len(selected) < target_stops and any(buckets.values()):
             before = len(selected)
@@ -1167,7 +1375,7 @@ def _select_candidates_by_style(candidates: list[dict], constraints: dict, targe
         for poi in remaining:
             if len(selected) >= target_stops:
                 break
-            if current_cost < target_cost or poi.get("category") in {"餐厅", "购物", "夜景"}:
+            if current_cost < target_cost or poi.get("category") in {"娱乐", "购物", "夜景", "展览"}:
                 selected.append(poi)
                 current_cost += _effective_unit_cost(poi) * people_count
     else:
@@ -1231,6 +1439,13 @@ def _fit_route_to_budget(
         )
         selected.remove(removable)
         selected_ids.discard(removable["id"])
+    while route_cost(selected) > budget_cap and len(selected) > 2:
+        removable = max(
+            selected,
+            key=lambda p: (_effective_unit_cost(p) * people_count, -p.get("_score", 0)),
+        )
+        selected.remove(removable)
+        selected_ids.discard(removable["id"])
 
     remaining = [p for p in candidates if p["id"] not in selected_ids]
     remaining.sort(key=lambda p: (_effective_unit_cost(p), -p.get("_score", 0)))
@@ -1239,7 +1454,7 @@ def _fit_route_to_budget(
         if len(selected) >= target_stops:
             break
         next_cost = route_cost(selected) + _effective_unit_cost(poi) * people_count
-        if len(selected) < min_stops or next_cost <= budget_cap:
+        if next_cost <= budget_cap:
             selected.append(poi)
             selected_ids.add(poi["id"])
 
@@ -1413,10 +1628,10 @@ def _order_multiday_route(route: list[dict], matrix: dict, trip_days: int, start
     day_templates = [
         ["公园", "景点", "展览"],
         ["餐厅"],
-        ["购物", "娱乐", "景点"],
-        ["咖啡", "甜品"],
+        ["娱乐", "购物", "景点"],
+        ["夜景", "咖啡", "甜品"],
         ["展览", "公园", "购物"],
-        ["餐厅", "夜景", "娱乐"],
+        ["夜景", "娱乐", "购物"],
     ]
     prev = None
 
@@ -1553,11 +1768,11 @@ def _daily_flow_bucket(poi: dict) -> int:
     category = poi.get("category", "")
     text = f"{poi.get('name', '')} {category} {' '.join(_safe_tags(poi))}".lower()
 
+    if any(word in text for word in ["早茶", "早餐", "brunch", "茶点", "茶楼", "茶餐厅"]):
+        return 1
     if category == "夜景" or any(word in text for word in ["夜景", "夜市", "酒吧", "灯光", "演出", "音乐节", "livehouse"]):
         return 7
     if category == "餐厅":
-        if any(word in text for word in ["早茶", "早餐", "brunch", "茶点"]):
-            return 1
         if any(word in text for word in ["火锅", "海底捞", "烧烤", "烤肉", "牛排", "酒吧", "夜宵", "宵夜", "居酒屋"]):
             return 6
         return 3
@@ -1576,13 +1791,16 @@ def _dedupe_route(route: list[dict]) -> list[dict]:
     result = []
     seen_ids = set()
     seen_names = set()
+    seen_families = set()
     for poi in route:
         name_key = _normalize_route_name(poi.get("name", ""))
-        if poi["id"] in seen_ids or name_key in seen_names:
+        family_key = _route_family_key(poi)
+        if poi["id"] in seen_ids or name_key in seen_names or family_key in seen_families:
             continue
         result.append(poi)
         seen_ids.add(poi["id"])
         seen_names.add(name_key)
+        seen_families.add(family_key)
     return result
 
 
@@ -1590,7 +1808,36 @@ def _normalize_route_name(name: str) -> str:
     return "".join(str(name or "").lower().split())
 
 
-def _bucket_and_select(pois: list[dict], max_stops: int, hard_limit: int = 8) -> list[dict]:
+def _route_family_key(poi: dict) -> str:
+    """Treat different branches of the same chain as one experience in a route."""
+    name = str(poi.get("name") or "")
+    category = str(poi.get("category") or "")
+    base = re.split(r"[（(\[]", name, maxsplit=1)[0]
+    base = re.sub(r"(总店|旗舰店|分店|门店|直营店|体验店|专卖店|加盟店)$", "", base)
+    base = re.sub(r"(广州|深圳|上海|北京|杭州|成都|重庆|武汉|南京|苏州|西安|天津|厦门|青岛|佛山|东莞)", "", base)
+    base = _normalize_route_name(base)
+    if not base:
+        base = _normalize_route_name(name)
+    return f"{category}:{base}"
+
+
+def _is_usable_single_day_route(route: list[dict], required_stops: int) -> bool:
+    route = _dedupe_route(route)
+    if len(route) < required_stops:
+        return False
+    food_count = sum(1 for poi in route if poi.get("category") in FOOD_CATEGORIES)
+    restaurant_count = sum(1 for poi in route if poi.get("category") == "餐厅")
+    activity_count = sum(1 for poi in route if poi.get("category") in ACTIVITY_CATEGORIES)
+    if restaurant_count > 1:
+        return False
+    if food_count > 2:
+        return False
+    if len(route) >= 4 and activity_count < 2:
+        return False
+    return True
+
+
+def _bucket_and_select(pois: list[dict], max_stops: int, hard_limit: int = 8, constraints: dict | None = None) -> list[dict]:
     buckets: dict[str, list[dict]] = {}
     for poi in pois:
         buckets.setdefault(poi.get("category", "其他"), []).append(poi)
@@ -1599,10 +1846,33 @@ def _bucket_and_select(pois: list[dict], max_stops: int, hard_limit: int = 8) ->
         bucket.sort(key=lambda x: x.get("_score", 0), reverse=True)
 
     selected = []
-    preferred_order = ["餐厅", "咖啡", "购物", "景点", "展览", "公园", "甜品", "娱乐", "夜景"]
+    seen_families: set[str] = set()
+    preferences = (constraints or {}).get("preferences") or []
+    desired = _desired_categories(preferences)
+    desired_order = [category for category in ["娱乐", "夜景", "购物", "展览", "景点", "公园", "餐厅", "咖啡", "甜品"] if category in desired]
+    persona_order = ((constraints or {}).get("persona_strategy") or {}).get("category_order") or []
+    preferred_order = list(dict.fromkeys(
+        desired_order
+        + persona_order
+        + ["娱乐", "夜景", "购物", "展览", "景点", "公园", "餐厅", "咖啡", "甜品"]
+    ))
+    food_taken = 0
+    restaurant_taken = 0
     for category in preferred_order:
         if category in buckets and buckets[category]:
-            selected.append(buckets[category].pop(0))
+            for index, poi in enumerate(list(buckets[category])):
+                if _route_family_key(poi) in seen_families:
+                    continue
+                if category == "餐厅" and restaurant_taken >= 1:
+                    continue
+                if category in FOOD_CATEGORIES and food_taken >= 2:
+                    continue
+                selected.append(poi)
+                seen_families.add(_route_family_key(poi))
+                food_taken += 1 if category in FOOD_CATEGORIES else 0
+                restaurant_taken += 1 if category == "餐厅" else 0
+                buckets[category].pop(index)
+                break
 
     remaining = [poi for bucket in buckets.values() for poi in bucket]
     remaining.sort(key=lambda x: x.get("_score", 0), reverse=True)
@@ -1610,11 +1880,14 @@ def _bucket_and_select(pois: list[dict], max_stops: int, hard_limit: int = 8) ->
 
     deduped = []
     seen = set()
+    seen_dedupe_families = set()
     for poi in selected:
-        if poi["id"] in seen:
+        family_key = _route_family_key(poi)
+        if poi["id"] in seen or family_key in seen_dedupe_families:
             continue
         deduped.append(poi)
         seen.add(poi["id"])
+        seen_dedupe_families.add(family_key)
         if len(deduped) >= max(max_stops + 3, hard_limit):
             break
 
@@ -1656,7 +1929,7 @@ def _is_too_similar(route: list[dict], existing_routes: list[list[dict]]) -> boo
     for existing in existing_routes:
         other = {poi["id"] for poi in existing}
         overlap = len(current & other) / max(len(current | other), 1)
-        if overlap >= 0.8:
+        if overlap >= 0.82:
             return True
     return False
 
@@ -1664,6 +1937,11 @@ def _is_too_similar(route: list[dict], existing_routes: list[list[dict]]) -> boo
 def _is_same_order(route: list[dict], existing_routes: list[list[dict]]) -> bool:
     current = [poi["id"] for poi in route]
     return any(current == [poi["id"] for poi in existing] for existing in existing_routes)
+
+
+def _is_same_stop_set(route: list[dict], existing_routes: list[list[dict]]) -> bool:
+    current = {poi["id"] for poi in route}
+    return any(current == {poi["id"] for poi in existing} for existing in existing_routes)
 
 
 def _rotate_route_order(route: list[dict], shift: int) -> list[dict]:

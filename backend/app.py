@@ -6,7 +6,7 @@ from config import load_config
 from chat_service import ChatService
 from db.database import init_db
 from db.seed import seed_pois
-from tools.amap import reverse_geocode, district_search, geocode_location, input_tips, search_poi, fetch_nearest_anchor
+from tools.amap import reverse_geocode, district_search, geocode_location, input_tips, search_poi, fetch_nearest_anchor, fetch_transit_plan
 from tools.xhs_ugc import search_xhs_public_notes, read_public_webpage
 
 app = Flask(__name__)
@@ -59,6 +59,7 @@ COMMON_CITY_DISTRICTS = {
 
 _DISTRICT_CACHE = {}
 _GEOCODE_CACHE = {}
+MAX_LOCATION_ACCURACY_M = 30
 
 
 def normalize_city_name(city: str) -> str:
@@ -78,6 +79,13 @@ def _text_value(value) -> str:
     if isinstance(value, list):
         return " ".join(str(item) for item in value if item)
     return str(value or "")
+
+
+def _float_value(value, default: float | None = None) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _poi_geocode_item(item: dict) -> dict | None:
@@ -278,17 +286,36 @@ def health():
 def reverse_location():
     data = request.get_json(silent=True) or {}
     location = data.get("location", "").strip()
+    accuracy_m = _float_value(data.get("accuracy_m"))
+    city_only = bool(data.get("city_only"))
 
     if not location:
         return jsonify({"error": "location is required"}), 400
+    if not city_only and accuracy_m is not None and accuracy_m > MAX_LOCATION_ACCURACY_M:
+        return jsonify({
+            "error": "location accuracy is too low",
+            "accuracy_m": accuracy_m,
+            "max_accuracy_m": MAX_LOCATION_ACCURACY_M,
+        }), 422
 
     result = reverse_geocode.invoke({"location": location})
     payload = json.loads(result)
     if not payload.get("error"):
-        try:
-            anchor = fetch_nearest_anchor(location, radius=20)
-        except Exception:
+        if data.get("fallback_address"):
+            payload["formatted_address"] = data.get("fallback_address")
+        if data.get("fallback_city"):
+            payload["city"] = data.get("fallback_city")
+        if data.get("fallback_district"):
+            payload["district"] = data.get("fallback_district")
+        if data.get("fallback_adcode"):
+            payload["adcode"] = data.get("fallback_adcode")
+        if city_only:
             anchor = None
+        else:
+            try:
+                anchor = fetch_nearest_anchor(location, radius=20)
+            except Exception:
+                anchor = None
         if anchor:
             original_location = payload.get("location") or location
             payload.update({
@@ -308,11 +335,15 @@ def reverse_location():
                 "location": anchor.get("location") or original_location,
                 "original_location": original_location,
                 "anchor_distance_m": anchor.get("distance_m"),
-                "source": "nearest_poi_20m",
+                "source": anchor.get("source") or "nearest_poi_20m",
             })
         else:
             payload.setdefault("original_location", location)
             payload.setdefault("source", "reverse_geocode")
+        if accuracy_m is not None:
+            payload["browser_accuracy_m"] = accuracy_m
+        if data.get("provider"):
+            payload["location_provider"] = data.get("provider")
     status = 400 if payload.get("error") else 200
     return jsonify(payload), status
 
@@ -434,6 +465,27 @@ def city_districts():
     response = {"city": city, "districts": normalized, "source": source}
     _DISTRICT_CACHE[city] = response
     return jsonify(response)
+
+
+@app.route("/api/route/transit", methods=["POST"])
+def route_transit():
+    data = request.get_json(silent=True) or {}
+    origin = (data.get("origin") or "").strip()
+    destination = (data.get("destination") or "").strip()
+    city = normalize_city_name(data.get("city") or "")
+    cityd = normalize_city_name(data.get("cityd") or city)
+
+    if not origin or not destination:
+        return jsonify({"error": "origin and destination are required"}), 400
+
+    try:
+        detail = fetch_transit_plan(origin, destination, city, cityd)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+    if not detail:
+        return jsonify({"error": "transit route unavailable"}), 404
+    return jsonify(detail)
 
 
 @app.route("/api/ugc/xhs/search", methods=["POST"])

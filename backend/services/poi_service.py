@@ -233,7 +233,7 @@ def _save_amap_pois(pois_data: list[dict], keyword: str, city_clean: str, limit:
             existing_poi = get_poi_by_id(existing["id"])
             if existing_poi:
                 inferred = _infer_category(poi.get("type", ""), keyword)
-                if inferred in {"咖啡", "展览", "购物", "夜景"} and existing_poi.get("category") != inferred:
+                if inferred in {"咖啡", "展览", "购物", "夜景", "餐厅", "甜品", "娱乐", "公园", "景点"} and existing_poi.get("category") != inferred:
                     execute_write("UPDATE poi SET category = ? WHERE id = ?", (inferred, existing["id"]))
                     existing_poi = get_poi_by_id(existing["id"])
                 saved_pois.append(existing_poi)
@@ -292,6 +292,7 @@ def search_or_fetch_pois(
     adcode: str | None = None,
     center: str | None = None,
     radius_m: int | None = None,
+    keyword_limit: int = 10,
 ) -> list[dict]:
     city = _normalize_city(city)
     local_pois = search_pois_by_preferences(city, preferences, max_cost, limit)
@@ -310,10 +311,11 @@ def search_or_fetch_pois(
     seen_names = {poi["name"] for poi in local_pois}
     fetched_pois = []
     raw_results: list[tuple[str, list[dict]]] = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    keyword_limit = max(4, min(10, keyword_limit))
+    with ThreadPoolExecutor(max_workers=min(5, keyword_limit)) as executor:
         future_map = {
             executor.submit(_amap_search_with_fallback, keyword, city, adcode, area, center): keyword
-            for keyword in keywords_to_search
+            for keyword in keywords_to_search[:keyword_limit]
         }
         for future in as_completed(future_map):
             keyword = future_map[future]
@@ -323,7 +325,7 @@ def search_or_fetch_pois(
                 raw_results.append((keyword, []))
 
     raw_by_keyword = {keyword: data for keyword, data in raw_results}
-    for keyword in keywords_to_search:
+    for keyword in keywords_to_search[:keyword_limit]:
         for poi in _save_amap_pois(raw_by_keyword.get(keyword, []), keyword, city, limit=6):
             if poi and poi["name"] not in seen_names:
                 fetched_pois.append(poi)
@@ -339,6 +341,7 @@ def search_or_fetch_pois(
             radius_m or 50000,
         )
 
+    combined = [poi for poi in combined if not _is_noise_poi(poi)]
     return _diversify_pois(combined, limit)
 
 
@@ -374,22 +377,38 @@ def _distance_m(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
 
 
 def _build_search_keywords(preferences: list[str] | None, area: str | None = None) -> list[str]:
-    keywords = []
+    preferences = preferences or []
+    preference_groups = []
     for pref in preferences or []:
-        keywords.extend(PREFERENCE_KEYWORDS.get(pref, [pref]))
+        group = PREFERENCE_KEYWORDS.get(pref, [pref])
+        preference_groups.append(group[:4])
+
+    keywords = []
+    max_group_len = max((len(group) for group in preference_groups), default=0)
+    for index in range(max_group_len):
+        for group in preference_groups:
+            if index < len(group):
+                keywords.append(group[index])
+
+    if any(pref in preferences for pref in ["游戏", "娱乐"]):
+        keywords.extend(["电竞馆", "电玩", "密室逃脱", "桌游吧", "Livehouse", "夜景"])
+    if any(pref in preferences for pref in ["夜景", "热闹"]):
+        keywords.extend(["夜景", "夜市", "Livehouse", "商圈"])
+    if any(pref in preferences for pref in ["美食"]):
+        keywords.extend(["高分餐厅", "本地菜", "老字号粤菜"])
 
     # 保证没有偏好或偏好很窄时，也能形成“玩、吃、休息、消费”四类候选。
-    core_keywords = ["景点", "餐厅", "咖啡店", "甜品", "商场", "博物馆", "公园", "小吃", "夜市", "娱乐", "演出", "市集"]
+    core_keywords = ["景点", "娱乐", "商场", "博物馆", "公园", "餐厅", "咖啡店", "甜品", "夜市", "演出", "市集"]
     keywords.extend(core_keywords)
     keywords = list(dict.fromkeys(k for k in keywords if k))
 
     if area:
         area = area.strip()
-        area_keywords = [f"{area} {keyword}" for keyword in keywords[:5] if area not in keyword]
-        area_keywords.extend([f"{area} {keyword}" for keyword in ["餐厅", "咖啡店", "甜品", "小吃", "商场", "电竞馆", "森林公园", "演出", "市集"]])
+        area_keywords = [f"{area} {keyword}" for keyword in keywords[:10] if area not in keyword]
+        area_keywords.extend([f"{area} {keyword}" for keyword in ["电竞馆", "密室逃脱", "Livehouse", "商场", "夜景", "餐厅", "咖啡店", "甜品", "森林公园", "演出", "市集"]])
         keywords = area_keywords + core_keywords + keywords
 
-    return list(dict.fromkeys(keywords))[:12]
+    return list(dict.fromkeys(keywords))[:14]
 
 
 def _amap_search_with_fallback(
@@ -401,7 +420,7 @@ def _amap_search_with_fallback(
 ) -> list[dict]:
     if center and "," in center:
         try:
-            nearby = json.loads(search_nearby.invoke({"location": center, "keyword": keyword, "radius": 9000}))
+            nearby = json.loads(search_nearby.invoke({"location": center, "keyword": keyword, "radius": 6500}))
             if isinstance(nearby, list) and nearby:
                 return nearby
         except Exception:
@@ -421,7 +440,7 @@ def _amap_search_with_fallback(
         pure_keyword = keyword.rsplit(" ", 1)[-1]
         attempts.append({"keyword": pure_keyword, "city": city})
 
-    for payload in attempts:
+    for payload in attempts[:3]:
         try:
             result = search_poi.invoke(payload)
             data = json.loads(result)
@@ -441,6 +460,7 @@ def _dedupe_pois(pois: list[dict]) -> list[dict]:
     for poi in pois:
         if not poi or _is_noise_poi(poi):
             continue
+        poi = _normalize_runtime_category(poi)
         name_key = _normalize_poi_name(poi.get("name", ""))
         if poi.get("id") in seen_ids or name_key in seen_names:
             continue
@@ -452,6 +472,27 @@ def _dedupe_pois(pois: list[dict]) -> list[dict]:
 
 def _normalize_poi_name(name: str) -> str:
     return re.sub(r"\s+", "", str(name or "").lower())
+
+
+def _normalize_runtime_category(poi: dict) -> dict:
+    tags = poi.get("tags") or ""
+    if isinstance(tags, str):
+        try:
+            parsed = json.loads(tags)
+            tags_text = " ".join(str(item) for item in parsed) if isinstance(parsed, list) else tags
+        except (TypeError, ValueError):
+            tags_text = tags
+    elif isinstance(tags, list):
+        tags_text = " ".join(str(item) for item in tags)
+    else:
+        tags_text = ""
+    inferred = _infer_category(
+        str(poi.get("category") or ""),
+        f"{poi.get('name', '')} {poi.get('address', '')} {tags_text}",
+    )
+    if inferred == poi.get("category"):
+        return poi
+    return {**poi, "category": inferred}
 
 
 def _diversify_pois(pois: list[dict], limit: int) -> list[dict]:
@@ -480,6 +521,10 @@ def _diversify_pois(pois: list[dict], limit: int) -> list[dict]:
 
 def _infer_category(poi_type: str, keyword: str = "") -> str:
     text = f"{poi_type} {keyword}".lower()
+    if any(word in text for word in ["甜品", "糖水", "双皮奶", "蛋糕", "面包"]):
+        return "甜品"
+    if any(word in text for word in ["早茶", "早餐", "茶楼", "茶餐厅", "茶点", "粤菜", "酒家", "食府", "火锅", "烧烤", "烤肉", "海鲜", "私房菜", "点心", "老字号"]):
+        return "餐厅"
     if any(word in text for word in ["咖啡", "coffee", "茶"]):
         return "咖啡"
     if any(word in text for word in ["博物馆", "展览", "美术", "艺术"]):
@@ -492,8 +537,6 @@ def _infer_category(poi_type: str, keyword: str = "") -> str:
         return "公园" if "公园" in text else "景点"
     if any(word in text for word in ["购物", "商场", "步行街", "百货"]):
         return "购物"
-    if any(word in text for word in ["甜品", "蛋糕", "面包"]):
-        return "甜品"
     if any(word in text for word in ["酒吧", "夜景", "观景"]):
         return "夜景"
     return "景点"
@@ -507,6 +550,13 @@ def _is_noise_poi(poi: dict) -> bool:
         "酒店", "民宿", "客栈", "宾馆", "旅馆", "住宿", "公寓", "售楼处", "房产小区",
         "演出公司", "演出设备", "演出器材", "设备租赁", "器材租赁", "灯光音响", "舞台设备",
         "有限公司", "科技公司", "餐饮管理", "企业管理", "文化传播",
+        "人民政府", "政府", "政务", "行政服务", "办事处", "街道办", "居委会", "村委会",
+        "法院", "检察院", "公安", "派出所", "交警", "税务", "社保", "医保",
+        "市场监督", "教育局", "财政局", "委员会", "人大", "政协",
+        "养老", "颐康", "康养", "老年", "老人", "长者", "护理院", "护理站",
+        "社区服务", "党群服务", "便民服务", "综合服务中心", "养老服务中心",
+        "卫生服务中心", "残疾人", "救助站", "福利院",
+        "不对外开放", "暂不开放", "暂停开放", "未开放", "内部使用", "内部区域", "非开放区域", "谢绝参观",
     ]
     if any(word in text for word in noise_words):
         return True
